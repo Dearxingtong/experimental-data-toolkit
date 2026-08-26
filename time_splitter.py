@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
@@ -62,7 +63,7 @@ class PositionSummary:
 class SheetSplitQC:
     sheet_name: str
     original_rows: int
-    position_rows: tuple[int, int, int]
+    position_rows: tuple[int, ...]
     total_rows: int
     all_rows_accounted_for: bool
     no_duplicate_assignments: bool
@@ -82,8 +83,110 @@ class SplitResult:
     output_files: list[tuple[str, bytes]]
 
 
+@dataclass
+class PositionRange:
+    label: str
+    start_time: time
+    end_time: time
+
+
+@dataclass
+class PositionRangeResult:
+    filename: str
+    position_summaries: tuple[PositionSummary, ...]
+    qc_results: list[SheetSplitQC]
+    output_files: list[tuple[str, bytes]]
+    output_workbooks: list[dict[str, pd.DataFrame]]
+
+
 def read_xlsx_workbook(file_bytes: bytes) -> dict[str, pd.DataFrame]:
     return pd.read_excel(BytesIO(file_bytes), sheet_name=None, engine="openpyxl")
+
+
+def parse_hhmm_time(value: str) -> tuple[time | None, str | None]:
+    stripped = value.strip()
+    if len(stripped) != 5 or stripped[2] != ":":
+        return None, "Please enter time in HH:MM format."
+
+    hour_text, minute_text = stripped.split(":", 1)
+    if not hour_text.isdigit() or not minute_text.isdigit():
+        return None, "Please enter time in HH:MM format."
+
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour > 23 or minute > 59:
+        return None, "Please enter time in HH:MM format."
+
+    return time(hour, minute), None
+
+
+def parse_time_component(
+    value: str,
+    position_label: str,
+    component_label: str,
+    maximum: int,
+) -> tuple[int | None, str | None]:
+    stripped = value.strip()
+    if not stripped:
+        return None, f"Please enter {position_label} {component_label}."
+
+    if not stripped.isdigit():
+        return None, f"{position_label} {component_label} must be between 00 and {maximum:02d}."
+
+    parsed_value = int(stripped)
+    if parsed_value > maximum:
+        return None, f"{position_label} {component_label} must be between 00 and {maximum:02d}."
+
+    return parsed_value, None
+
+
+def build_time_range_from_parts(
+    position_label: str,
+    start_hour_text: str,
+    start_minute_text: str,
+    end_hour_text: str,
+    end_minute_text: str,
+) -> tuple[time | None, time | None, list[str]]:
+    """Convert separate HH/MM text inputs into validated start and end times."""
+    errors: list[str] = []
+    start_hour, start_hour_error = parse_time_component(
+        start_hour_text,
+        position_label,
+        "Start Hour",
+        23,
+    )
+    start_minute, start_minute_error = parse_time_component(
+        start_minute_text,
+        position_label,
+        "Start Minute",
+        59,
+    )
+    end_hour, end_hour_error = parse_time_component(
+        end_hour_text,
+        position_label,
+        "End Hour",
+        23,
+    )
+    end_minute, end_minute_error = parse_time_component(
+        end_minute_text,
+        position_label,
+        "End Minute",
+        59,
+    )
+
+    for error in (
+        start_hour_error,
+        start_minute_error,
+        end_hour_error,
+        end_minute_error,
+    ):
+        if error:
+            errors.append(error)
+
+    if errors:
+        return None, None, errors
+
+    return time(start_hour, start_minute), time(end_hour, end_minute), []
 
 
 def find_timestamp_column(dataframe: pd.DataFrame) -> str | None:
@@ -218,6 +321,23 @@ def split_dataframe_by_boundaries(
     )
 
 
+def range_to_boundaries(experiment_date, position_range: PositionRange) -> tuple[datetime, datetime]:
+    start_boundary = datetime.combine(experiment_date, position_range.start_time)
+    end_boundary = datetime.combine(experiment_date, position_range.end_time) + timedelta(minutes=1)
+    return start_boundary, end_boundary
+
+
+def split_dataframe_by_range(
+    dataframe: pd.DataFrame,
+    timestamp_column: str,
+    start_boundary: datetime,
+    end_boundary: datetime,
+) -> pd.DataFrame:
+    parsed = parse_timestamp_series(dataframe[timestamp_column])
+    mask = (parsed >= start_boundary) & (parsed < end_boundary)
+    return dataframe.loc[mask].copy()
+
+
 def summarize_position(label: str, dataframe: pd.DataFrame, timestamp_column: str | None) -> PositionSummary:
     if dataframe.empty or timestamp_column is None:
         return PositionSummary(label, len(dataframe), None, None)
@@ -245,6 +365,146 @@ def check_split_qc(
         total_rows=total_rows,
         all_rows_accounted_for=total_rows == original_rows,
         no_duplicate_assignments=len(assigned_indices) == len(set(assigned_indices)),
+    )
+
+
+def check_position_range_qc(
+    sheet_name: str,
+    split_dataframes: tuple[pd.DataFrame, ...],
+) -> bool:
+    assigned_indices: list[int] = []
+    for frame in split_dataframes:
+        assigned_indices.extend(frame.index.tolist())
+    return len(assigned_indices) == len(set(assigned_indices))
+
+
+def validate_position_ranges(
+    analysis: WorkbookAnalysis,
+    position_ranges: list[PositionRange],
+) -> tuple[list[tuple[datetime, datetime]] | None, str | None]:
+    primary = analysis.primary_sheet
+    if primary is None:
+        return None, f"{analysis.filename} cannot be split because no TIMESTAMP data was found."
+
+    experiment_date = primary.first_timestamp.date()
+    experiment_start = primary.first_timestamp.to_pydatetime()
+    experiment_end = primary.last_timestamp.to_pydatetime()
+    boundaries: list[tuple[datetime, datetime]] = []
+
+    for position_range in position_ranges:
+        if position_range.start_time > position_range.end_time:
+            return None, f"{position_range.label}: Start Time cannot be later than End Time."
+
+        start_boundary, end_boundary = range_to_boundaries(experiment_date, position_range)
+        if end_boundary <= experiment_start or start_boundary > experiment_end:
+            return None, f"{position_range.label}: requested range is outside the experimental time range."
+
+        split_frame = split_dataframe_by_range(
+            analysis.worksheets[primary.sheet_name],
+            primary.timestamp_column,
+            start_boundary,
+            end_boundary,
+        )
+        if split_frame.empty:
+            return None, f"{position_range.label}: requested range contains no observations."
+
+        boundaries.append((start_boundary, end_boundary))
+
+    for left_index, left in enumerate(boundaries):
+        for right_index, right in enumerate(boundaries[left_index + 1 :], start=left_index + 1):
+            if max(left[0], right[0]) < min(left[1], right[1]):
+                return (
+                    None,
+                    f"{position_ranges[left_index].label} and {position_ranges[right_index].label} "
+                    "contain overlapping time ranges.",
+                )
+
+    return boundaries, None
+
+
+def split_workbook_by_position_ranges(
+    analysis: WorkbookAnalysis,
+    position_ranges: list[PositionRange],
+    output_filenames: list[str],
+    workbook_transformer: Callable[[int, dict[str, pd.DataFrame]], dict[str, pd.DataFrame]] | None = None,
+) -> tuple[PositionRangeResult | None, str | None]:
+    if analysis.errors:
+        return None, " ".join(analysis.errors)
+    if len(position_ranges) != len(output_filenames):
+        return None, "Position ranges and output filenames must have the same count."
+
+    boundaries, validation_error = validate_position_ranges(analysis, position_ranges)
+    if validation_error or boundaries is None:
+        return None, validation_error
+
+    timestamp_sheets = {
+        sheet.sheet_name: sheet.timestamp_column for sheet in analysis.time_series_sheets
+    }
+    primary = analysis.primary_sheet
+    if primary is None:
+        return None, f"{analysis.filename} cannot be split because no TIMESTAMP data was found."
+
+    output_workbooks: list[dict[str, pd.DataFrame]] = [
+        {} for _position_range in position_ranges
+    ]
+    position_summaries: list[PositionSummary] = []
+    qc_results: list[SheetSplitQC] = []
+
+    for sheet_name, dataframe in analysis.worksheets.items():
+        timestamp_column = timestamp_sheets.get(sheet_name)
+        if timestamp_column is None:
+            for output_workbook in output_workbooks:
+                output_workbook[sheet_name] = dataframe.copy()
+            continue
+
+        sheet_splits = tuple(
+            split_dataframe_by_range(dataframe, timestamp_column, start, end)
+            for start, end in boundaries
+        )
+
+        if sheet_name == primary.sheet_name:
+            position_summaries = [
+                summarize_position(position_range.label, split_frame, timestamp_column)
+                for position_range, split_frame in zip(position_ranges, sheet_splits)
+            ]
+
+        no_duplicate_assignments = check_position_range_qc(sheet_name, sheet_splits)
+        qc_results.append(
+            SheetSplitQC(
+                sheet_name=sheet_name,
+                original_rows=len(dataframe),
+                position_rows=tuple(len(frame) for frame in sheet_splits),
+                total_rows=sum(len(frame) for frame in sheet_splits),
+                all_rows_accounted_for=True,
+                no_duplicate_assignments=no_duplicate_assignments,
+            )
+        )
+        if not no_duplicate_assignments:
+            return None, f"QC checks failed for worksheet {sheet_name}: overlapping observations detected."
+
+        for index, split_frame in enumerate(sheet_splits):
+            output_workbooks[index][sheet_name] = split_frame.reset_index(drop=True)
+
+    output_files = []
+    final_output_workbooks = []
+    for position_number, (output_filename, output_workbook) in enumerate(
+        zip(output_filenames, output_workbooks),
+        start=1,
+    ):
+        if workbook_transformer is not None:
+            output_workbook = workbook_transformer(position_number, output_workbook)
+        final_output_workbooks.append(output_workbook)
+        output_files.append((output_filename, write_xlsx_workbook(output_workbook)))
+
+    return (
+        PositionRangeResult(
+            filename=analysis.filename,
+            position_summaries=tuple(position_summaries),
+            qc_results=qc_results,
+            output_files=output_files,
+            output_workbooks=final_output_workbooks,
+        ),
+        None,
     )
 
 

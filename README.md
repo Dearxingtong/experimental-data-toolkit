@@ -4,9 +4,9 @@ Experimental Data Toolkit is a lightweight Streamlit web application for routine
 
 ## What It Does
 
-The MVP includes two tools:
+The MVP includes three tools:
 
-- **DAT → XLSX**: Upload up to 10 experimental `.dat` files, clean the sensor columns, enter per-file cut times, split each file into three positions, and download individual XLSX outputs or one ZIP.
+- **DAT → XLSX**: Process one experimental `.dat` file at a time, assign Case No and Case Date, optionally split into 2 to 6 user-defined Positions, and download XLSX and CSV outputs.
 - **Merge CSV Files**: Upload two or more `.csv` files, preview each file, merge them vertically by rows, and download the merged result as CSV or XLSX.
 - **Split by Time**: Upload one or more experimental `.xlsx` time-series workbooks, select two per-file cut times, split every timestamped worksheet into three position files, and download the results.
 
@@ -34,14 +34,22 @@ Then open the local Streamlit URL shown in your terminal.
 
 ### DAT → XLSX
 
-- Upload one to ten DAT files.
+- Upload and process one DAT file at a time.
+- Continue adding completed DAT files to the current batch until you choose to finish it.
 - Use the second DAT row as source column names and rows 5 onward as observations.
 - Keep and rename the required sensor columns to `TIMESTAMP`, `U1`, `V1`, `W1`, `Temp1`, `U2`, `V2`, `W2`, `Temp2`, `U3`, `V3`, `W3`, and `Temp3`.
 - Remove unneeded columns such as `RECORD`, `A_SensorStatus`, `B_SensorStatus`, and `C_SensorStatus` from the cleaned output.
-- Create XLSX workbooks with `Cleaned_Data` and `Raw_Data` worksheets.
-- Enter independent `HH:MM` cut times for every uploaded DAT file.
-- Split each processed DAT file into Position 1, Position 2, and Position 3 using the validated time-splitting logic.
-- Download full XLSX and position XLSX files individually, or download all generated outputs as one ZIP.
+- Enter required Case No and Case Date for output naming.
+- Generate the complete Full Dataset for every processed case.
+- Choose Split Yes or No for each file.
+- If Split is Yes, choose 2 through 6 Positions and enter separate Start HH, Start MM, End HH, and End MM values for each Position.
+- Position gaps are allowed; overlaps are rejected.
+- Position workbooks add derived velocity columns in `Cleaned_Data` only: P01-P03 use `Vx = W`, `Vy = -U`, `Vz = -V`; P04-P06 use `Vx = -W`, `Vy = U`, `Vz = -V`.
+- The Full Dataset XLSX remains untransformed, and every XLSX contains `Cleaned_Data` and `Raw_Data`.
+- CSV outputs contain `Cleaned_Data` only; no Raw CSV files are created.
+- Output filenames use the Case No and Case Date, such as `C03_All_26.08.26.xlsx`, `C03_All_26.08.26.csv`, `C03_P01_26.08.26.xlsx`, and `C03_P01_26.08.26.csv`.
+- Download the current case outputs immediately, process the next file, or finish the batch.
+- Download all generated XLSX and CSV outputs for the current case or final batch as one ZIP.
 
 ### Merge CSV Files
 

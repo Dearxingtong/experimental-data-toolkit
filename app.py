@@ -1,33 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import time, timedelta
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 from io import BytesIO, StringIO
-import re
 
 import pandas as pd
 import streamlit as st
 
+from dat_batch import (
+    all_workbook_filename,
+    normalize_case_number,
+    position_workbook_filename,
+    format_case_date,
+)
 from dat_processor import (
-    FINAL_COLUMNS,
+    add_transformed_velocity_columns,
     build_xlsx_zip,
-    dat_output_filename,
     dat_to_xlsx_bytes,
-    process_dat_uploads,
+    process_dat_upload,
+    velocity_transform_description,
 )
 from time_splitter import (
+    PositionRange,
     WorkbookAnalysis,
     analyze_workbook_dataframes,
     build_zip as build_split_zip,
     analyze_xlsx_upload,
+    build_time_range_from_parts,
+    parse_hhmm_time,
+    split_workbook_by_position_ranges,
     split_workbook,
 )
 
 
 CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 PREVIEW_ROWS = 20
-MAX_DAT_UPLOADS = 10
-HHMM_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+MIN_DAT_POSITIONS = 2
+MAX_DAT_POSITIONS = 6
 
 
 @dataclass
@@ -38,10 +47,30 @@ class UploadedDataset:
 
 
 @dataclass
-class DatBatchOutput:
-    filename: str
+class DatasetDownload:
+    label: str
+    rows: int
+    xlsx_filename: str
+    xlsx_bytes: bytes
+    csv_filename: str
+    csv_bytes: bytes
+
+
+@dataclass
+class CompletedDatCase:
+    original_filename: str
+    case_number: str
+    case_date: date
+    split_enabled: bool
+    position_count: int
+    position_ranges: list[tuple[str, str, str]]
+    all_rows: int
+    raw_rows: int
     files: list[tuple[str, bytes]]
-    split_result: object
+    position_summaries: tuple
+    qc_results: list
+    velocity_transform_notes: tuple[str, ...] = tuple()
+    datasets: list[DatasetDownload] = field(default_factory=list)
 
 
 def read_csv_upload(uploaded_file) -> tuple[UploadedDataset | None, str | None]:
@@ -91,6 +120,12 @@ def dataframe_to_xlsx_bytes(dataframe: pd.DataFrame) -> bytes:
 
 def dataframe_to_csv_bytes(dataframe: pd.DataFrame) -> bytes:
     return dataframe.to_csv(index=False).encode("utf-8-sig")
+
+
+def xlsx_filename_to_csv(filename: str) -> str:
+    if filename.lower().endswith(".xlsx"):
+        return f"{filename[:-5]}.csv"
+    return f"{filename}.csv"
 
 
 def show_dataset_preview(dataset: UploadedDataset) -> None:
@@ -210,18 +245,18 @@ def inject_global_styles() -> None:
             padding-top: 1rem;
             margin-top: 1rem;
         }
+        .edt-next-step {
+            margin-top: 1.75rem;
+            padding-top: 1.25rem;
+            border-top: 2px solid #dbeafe;
+            font-size: 28px;
+            font-weight: 800;
+            color: #111827;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-
-def parse_hhmm_time(value: str) -> tuple[time | None, str | None]:
-    stripped = value.strip()
-    match = HHMM_PATTERN.match(stripped)
-    if not match:
-        return None, "Please enter time in HH:MM format."
-    return time(int(match.group(1)), int(match.group(2))), None
 
 
 def dat_split_analysis(processed_file):
@@ -230,207 +265,558 @@ def dat_split_analysis(processed_file):
             "Cleaned_Data": processed_file.cleaned_dataframe,
             "Raw_Data": processed_file.raw_dataframe,
         },
-        dat_output_filename(processed_file.filename),
+        processed_file.filename,
     )
 
 
-def build_dat_batch_output(processed_file, end_position1: time, end_position2: time):
-    output_name = dat_output_filename(processed_file.filename)
-    full_file = (output_name, dat_to_xlsx_bytes(processed_file))
-    analysis = dat_split_analysis(processed_file)
-    result, split_error = split_workbook(analysis, end_position1, end_position2)
-    if split_error:
-        return None, split_error
-    if result is None:
-        return None, f"{processed_file.filename} could not be split."
-    return DatBatchOutput(processed_file.filename, [full_file] + result.output_files, result), None
+def transform_dat_position_workbook(
+    position_number: int,
+    workbook: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    transformed_workbook = {
+        sheet_name: dataframe.copy()
+        for sheet_name, dataframe in workbook.items()
+    }
+    if "Cleaned_Data" in transformed_workbook:
+        transformed_workbook["Cleaned_Data"] = add_transformed_velocity_columns(
+            transformed_workbook["Cleaned_Data"],
+            position_number,
+        )
+    return transformed_workbook
+
+
+def dat_velocity_transform_notes(position_count: int) -> tuple[str, ...]:
+    notes: list[str] = []
+    if position_count >= 1:
+        first_group_end = min(3, position_count)
+        notes.append(
+            f"P01-P{first_group_end:02d}: {velocity_transform_description(1)}"
+        )
+    if position_count >= 4:
+        notes.append(
+            f"P04-P{position_count:02d}: {velocity_transform_description(4)}"
+        )
+    return tuple(notes)
+
+
+def build_completed_dat_case(
+    processed_file,
+    case_number: str,
+    case_date: date,
+    split_enabled: bool,
+    position_ranges: list[PositionRange],
+) -> tuple[CompletedDatCase | None, str | None]:
+    all_filename = all_workbook_filename(case_number, case_date)
+    all_xlsx_bytes = dat_to_xlsx_bytes(processed_file)
+    all_csv_filename = xlsx_filename_to_csv(all_filename)
+    all_csv_bytes = dataframe_to_csv_bytes(processed_file.cleaned_dataframe)
+    files = [
+        (all_filename, all_xlsx_bytes),
+        (all_csv_filename, all_csv_bytes),
+    ]
+    datasets = [
+        DatasetDownload(
+            label="Full Dataset",
+            rows=processed_file.data_row_count,
+            xlsx_filename=all_filename,
+            xlsx_bytes=all_xlsx_bytes,
+            csv_filename=all_csv_filename,
+            csv_bytes=all_csv_bytes,
+        )
+    ]
+    position_summaries = tuple()
+    qc_results = []
+
+    if split_enabled:
+        analysis = analyze_workbook_dataframes(
+            {
+                "Cleaned_Data": processed_file.cleaned_dataframe,
+                "Raw_Data": processed_file.raw_dataframe,
+            },
+            all_filename,
+        )
+        position_filenames = [
+            position_workbook_filename(case_number, index + 1, case_date)
+            for index in range(len(position_ranges))
+        ]
+        result, split_error = split_workbook_by_position_ranges(
+            analysis,
+            position_ranges,
+            position_filenames,
+            workbook_transformer=transform_dat_position_workbook,
+        )
+        if split_error:
+            return None, split_error
+        if result is None:
+            return None, f"{processed_file.filename} could not be split."
+        for summary, (xlsx_filename, xlsx_bytes), workbook in zip(
+            result.position_summaries,
+            result.output_files,
+            result.output_workbooks,
+        ):
+            csv_filename = xlsx_filename_to_csv(xlsx_filename)
+            cleaned_data = workbook["Cleaned_Data"]
+            csv_bytes = dataframe_to_csv_bytes(cleaned_data)
+            files.extend(
+                [
+                    (xlsx_filename, xlsx_bytes),
+                    (csv_filename, csv_bytes),
+                ]
+            )
+            datasets.append(
+                DatasetDownload(
+                    label=summary.label,
+                    rows=summary.rows,
+                    xlsx_filename=xlsx_filename,
+                    xlsx_bytes=xlsx_bytes,
+                    csv_filename=csv_filename,
+                    csv_bytes=csv_bytes,
+                )
+            )
+        position_summaries = result.position_summaries
+        qc_results = result.qc_results
+
+    all_preserved = (
+        len(processed_file.cleaned_dataframe) == processed_file.data_row_count
+        and len(processed_file.raw_dataframe) == processed_file.data_row_count
+    )
+    if not all_preserved:
+        return None, "Full Dataset preservation check failed."
+
+    return (
+        CompletedDatCase(
+            original_filename=processed_file.filename,
+            case_number=case_number,
+            case_date=case_date,
+            split_enabled=split_enabled,
+            position_count=len(position_ranges) if split_enabled else 0,
+            position_ranges=[
+                (position_range.label, position_range.start_time.strftime("%H:%M"), position_range.end_time.strftime("%H:%M"))
+                for position_range in position_ranges
+            ],
+            all_rows=processed_file.data_row_count,
+            raw_rows=len(processed_file.raw_dataframe),
+            files=files,
+            position_summaries=position_summaries,
+            qc_results=qc_results,
+            velocity_transform_notes=(
+                dat_velocity_transform_notes(len(position_ranges))
+                if split_enabled
+                else tuple()
+            ),
+            datasets=datasets,
+        ),
+        None,
+    )
+
+
+def init_dat_batch_state() -> None:
+    st.session_state.setdefault("dat_completed_cases", [])
+    st.session_state.setdefault("dat_current_result", None)
+    st.session_state.setdefault("dat_batch_finished", False)
+    st.session_state.setdefault("dat_uploader_version", 0)
+
+
+def reset_current_dat_form() -> None:
+    st.session_state["dat_current_result"] = None
+    st.session_state["dat_uploader_version"] = st.session_state.get("dat_uploader_version", 0) + 1
+
+
+def start_new_dat_batch() -> None:
+    st.session_state["dat_completed_cases"] = []
+    st.session_state["dat_current_result"] = None
+    st.session_state["dat_batch_finished"] = False
+    st.session_state["dat_uploader_version"] = st.session_state.get("dat_uploader_version", 0) + 1
+
+
+def case_key(case_number: str, case_date: date) -> tuple[str, str]:
+    return case_number, format_case_date(case_date)
+
+
+def case_already_used(case_number: str, case_date: date) -> bool:
+    key = case_key(case_number, case_date)
+    for completed_case in st.session_state.get("dat_completed_cases", []):
+        if case_key(completed_case.case_number, completed_case.case_date) == key:
+            return True
+    return False
+
+
+def detected_case_date(processed_file) -> date:
+    timestamps = pd.to_datetime(processed_file.cleaned_dataframe["TIMESTAMP"], format="mixed")
+    return timestamps.iloc[0].date()
+
+
+def render_completed_case_downloads(completed_case: CompletedDatCase, prefix: str) -> None:
+    st.markdown("### Downloads")
+    header_cols = st.columns([2.1, 1, 1.4, 1.4])
+    header_cols[0].markdown("**Dataset**")
+    header_cols[1].markdown("**Rows**")
+    header_cols[2].markdown("**XLSX**")
+    header_cols[3].markdown("**CSV**")
+
+    for dataset in completed_case.datasets:
+        xlsx_label = (
+            "Download Full XLSX"
+            if dataset.label == "Full Dataset"
+            else f"Download {dataset.label} XLSX"
+        )
+        csv_label = (
+            "Download Full CSV"
+            if dataset.label == "Full Dataset"
+            else f"Download {dataset.label} CSV"
+        )
+        row_cols = st.columns([2.1, 1, 1.4, 1.4])
+        row_cols[0].write(dataset.label)
+        row_cols[1].write(f"{dataset.rows:,}")
+        row_cols[2].download_button(
+            label=xlsx_label,
+            data=dataset.xlsx_bytes,
+            file_name=dataset.xlsx_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{prefix}_{completed_case.case_number}_{format_case_date(completed_case.case_date)}_{dataset.xlsx_filename}",
+        )
+        row_cols[3].download_button(
+            label=csv_label,
+            data=dataset.csv_bytes,
+            file_name=dataset.csv_filename,
+            mime="text/csv",
+            key=f"{prefix}_{completed_case.case_number}_{format_case_date(completed_case.case_date)}_{dataset.csv_filename}",
+        )
+
+    st.download_button(
+        label="Download All Files (ZIP)",
+        data=build_xlsx_zip(completed_case.files),
+        file_name=f"C{completed_case.case_number}_{format_case_date(completed_case.case_date)}_files.zip",
+        mime="application/zip",
+        key=f"{prefix}_{completed_case.case_number}_{format_case_date(completed_case.case_date)}_case_zip",
+    )
+
+
+def render_completed_case_summary(completed_case: CompletedDatCase) -> None:
+    st.markdown(
+        f"## C{completed_case.case_number} — {format_case_date(completed_case.case_date)}"
+    )
+    st.write("✓ Processing completed successfully.")
+    st.write(f"Full Dataset: `{completed_case.all_rows:,}` rows")
+
+    for summary in completed_case.position_summaries:
+        st.write(f"{summary.label}: `{summary.rows:,}` rows")
+
+    st.write("✓ Full Dataset preserved")
+    if completed_case.split_enabled:
+        if all(qc.no_duplicate_assignments for qc in completed_case.qc_results):
+            st.write("✓ All Position ranges processed")
+            st.write("✓ No overlapping observations")
+        else:
+            st.error("Position QC failed.")
+        for note in completed_case.velocity_transform_notes:
+            st.write(note)
+
+    render_completed_case_downloads(completed_case, "current_download")
+
+
+def render_completed_files_section() -> None:
+    completed_cases = st.session_state.get("dat_completed_cases", [])
+    if not completed_cases:
+        return
+
+    with st.expander(f"Completed Files ({len(completed_cases)})", expanded=False):
+        summary_rows = []
+        for completed_case in completed_cases:
+            outputs = "Full"
+            if completed_case.split_enabled:
+                outputs = f"Full + P01-P{completed_case.position_count:02d}"
+            summary_rows.append(
+                {
+                    "Case": f"C{completed_case.case_number}",
+                    "Date": format_case_date(completed_case.case_date),
+                    "Split": (
+                        f"{completed_case.position_count} Positions"
+                        if completed_case.split_enabled
+                        else "No"
+                    ),
+                    "Outputs": outputs,
+                }
+            )
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        for completed_case in completed_cases:
+            st.markdown(
+                f"**C{completed_case.case_number} — {format_case_date(completed_case.case_date)}**"
+            )
+            render_completed_case_downloads(completed_case, "completed_download")
+
+
+def render_batch_complete() -> None:
+    completed_cases = st.session_state.get("dat_completed_cases", [])
+    st.markdown("# Batch Complete")
+    st.write(f"{len(completed_cases)} DAT files processed")
+    render_completed_files_section()
+    all_files = [
+        output_file
+        for completed_case in completed_cases
+        for output_file in completed_case.files
+    ]
+    if all_files:
+        st.download_button(
+            label="Download All Files (ZIP)",
+            data=build_xlsx_zip(all_files),
+            file_name="processed_dat_files.zip",
+            mime="application/zip",
+            key="finished_batch_zip",
+        )
+    if st.button("Start New Batch", type="primary"):
+        start_new_dat_batch()
+        st.rerun()
+
+
+def collect_position_ranges(position_count: int, key_prefix: str) -> tuple[list[PositionRange], list[str]]:
+    position_ranges: list[PositionRange] = []
+    errors: list[str] = []
+    st.markdown("### Position Time Ranges")
+    header_cols = st.columns([1.1, 1, 0.15, 1, 0.35, 1, 0.15, 1])
+    header_cols[0].markdown("**Position**")
+    header_cols[1].markdown("**Start HH**")
+    header_cols[2].markdown("&nbsp;")
+    header_cols[3].markdown("**Start MM**")
+    header_cols[5].markdown("**End HH**")
+    header_cols[6].markdown("&nbsp;")
+    header_cols[7].markdown("**End MM**")
+
+    for position_number in range(1, position_count + 1):
+        label = f"P{position_number:02d}"
+        row_cols = st.columns([1.1, 1, 0.15, 1, 0.35, 1, 0.15, 1])
+        row_cols[0].write(label)
+        start_hour_text = row_cols[1].text_input(
+            f"{label} Start Hour",
+            value="",
+            placeholder="HH",
+            label_visibility="collapsed",
+            key=f"{key_prefix}_start_hour_{position_number}",
+        )
+        row_cols[2].write(":")
+        start_minute_text = row_cols[3].text_input(
+            f"{label} Start Minute",
+            value="",
+            placeholder="MM",
+            label_visibility="collapsed",
+            key=f"{key_prefix}_start_minute_{position_number}",
+        )
+        end_hour_text = row_cols[5].text_input(
+            f"{label} End Hour",
+            value="",
+            placeholder="HH",
+            label_visibility="collapsed",
+            key=f"{key_prefix}_end_hour_{position_number}",
+        )
+        row_cols[6].write(":")
+        end_minute_text = row_cols[7].text_input(
+            f"{label} End Minute",
+            value="",
+            placeholder="MM",
+            label_visibility="collapsed",
+            key=f"{key_prefix}_end_minute_{position_number}",
+        )
+
+        start_time, end_time, range_errors = build_time_range_from_parts(
+            label,
+            start_hour_text,
+            start_minute_text,
+            end_hour_text,
+            end_minute_text,
+        )
+        errors.extend(range_errors)
+        if start_time is not None and end_time is not None:
+            position_ranges.append(PositionRange(label, start_time, end_time))
+
+    return position_ranges, errors
+
+
+def validate_case_inputs(
+    case_no_input: str,
+    case_date_input,
+    split_enabled: bool,
+    position_count: int,
+    position_ranges: list[PositionRange],
+    position_errors: list[str],
+) -> tuple[str | None, list[str]]:
+    errors: list[str] = []
+    case_number, case_error = normalize_case_number(case_no_input)
+    if case_error:
+        errors.append(case_error)
+
+    if case_date_input is None:
+        errors.append("Please select a Case Date.")
+
+    if split_enabled:
+        if position_count < MIN_DAT_POSITIONS or position_count > MAX_DAT_POSITIONS:
+            errors.append(
+                f"Split Position count must be between {MIN_DAT_POSITIONS} and {MAX_DAT_POSITIONS}."
+            )
+        if position_errors:
+            errors.extend(position_errors)
+        if len(position_ranges) != position_count:
+            errors.append("Please enter Start Time and End Time for all Positions.")
+
+    if case_number and case_date_input is not None and case_already_used(case_number, case_date_input):
+        errors.append("This Case No and Case Date combination has already been used in the current batch.")
+
+    return case_number, errors
 
 
 def render_dat_to_xlsx_tool() -> None:
-    st.subheader("DAT → XLSX & Time Split")
-    st.write("Upload up to 10 DAT files. Each file will be converted and split into three positions.")
+    init_dat_batch_state()
+    completed_count = len(st.session_state["dat_completed_cases"])
+
+    st.subheader("DAT → XLSX")
+    st.write(f"Files processed in current batch: {completed_count}")
+
+    if st.session_state.get("dat_batch_finished"):
+        render_batch_complete()
+        return
+
+    current_result = st.session_state.get("dat_current_result")
+    if current_result:
+        render_completed_case_summary(current_result)
+        st.markdown('<div class="edt-next-step">Process another file?</div>', unsafe_allow_html=True)
+        next_col, finish_col = st.columns(2)
+        if next_col.button("Process Next File"):
+            reset_current_dat_form()
+            st.rerun()
+        if finish_col.button("Finish Batch", type="primary"):
+            st.session_state["dat_batch_finished"] = True
+            st.rerun()
+        return
+
+    render_completed_files_section()
+
+    st.markdown("## Current File")
     uploaded_files = st.file_uploader(
-        "Upload DAT files",
+        "Upload one DAT file",
         type=["dat"],
-        accept_multiple_files=True,
-        key="dat_uploads",
+        accept_multiple_files=False,
+        key=f"dat_upload_{st.session_state['dat_uploader_version']}",
     )
 
-    if uploaded_files and len(uploaded_files) > MAX_DAT_UPLOADS:
-        st.error("A maximum of 10 DAT files can be processed at one time.")
+    if uploaded_files is None:
+        st.info("Upload one DAT file to begin. Completed files remain stored in this batch session.")
         return
 
-    processed_files, errors = process_dat_uploads(uploaded_files)
-    show_upload_errors(errors)
-
-    if not processed_files:
-        st.info("Upload 1 to 10 DAT files to configure cut times and process the batch.")
+    processed_file, parse_error = process_dat_upload(uploaded_files)
+    if parse_error:
+        st.error(parse_error)
         return
 
-    st.markdown("## Files to Process")
-    st.write("Enter cut times in 24-hour `HH:MM` format for each file.")
-    configured_files = []
-    validation_errors: list[str] = []
-    batch_signature_parts = []
-
-    for index, processed_file in enumerate(processed_files):
-        dat_key = f"{index}_{processed_file.filename}_{processed_file.data_row_count}"
-        st.markdown('<div class="edt-card">', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="edt-card-title">{processed_file.filename}</div>',
-            unsafe_allow_html=True,
+    timestamps = pd.to_datetime(processed_file.cleaned_dataframe["TIMESTAMP"], format="mixed")
+    with st.container(border=True):
+        st.markdown("### Current File")
+        st.write(f"Original filename: `{processed_file.filename}`")
+        st.write(f"Observations: `{processed_file.data_row_count:,}`")
+        st.write(
+            "Detected time range: "
+            f"`{format_timestamp(timestamps.iloc[0])}` → `{format_timestamp(timestamps.iloc[-1])}`"
         )
 
-        range_text = "Data range unavailable"
-        if "TIMESTAMP" in processed_file.cleaned_dataframe.columns:
-            timestamp_values = pd.to_datetime(
-                processed_file.cleaned_dataframe["TIMESTAMP"],
-                format="mixed",
-            )
-            range_text = (
-                f"{format_timestamp(timestamp_values.iloc[0])} → "
-                f"{format_timestamp(timestamp_values.iloc[-1])}"
-            )
-
-        st.markdown(
-            f"""
-            <div class="edt-muted">
-            {processed_file.data_row_count:,} observations ·
-            {processed_file.original_column_count:,} original columns ·
-            encoding: {processed_file.encoding}<br>
-            Data range: {range_text}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        input_col1, input_col2 = st.columns(2)
-        end_position1_text = input_col1.text_input(
-            "End of Position 1",
+        st.markdown("### Case Information")
+        case_col, date_col, split_col = st.columns([1, 1, 1])
+        case_no_input = case_col.text_input(
+            "Case No",
             value="",
-            placeholder="HH:MM",
-            key=f"dat_end_position1_text_{dat_key}",
+            placeholder="3",
+            key=f"dat_case_no_{st.session_state['dat_uploader_version']}",
         )
-        input_col1.caption("HH:MM")
-        end_position2_text = input_col2.text_input(
-            "End of Position 2",
-            value="",
-            placeholder="HH:MM",
-            key=f"dat_end_position2_text_{dat_key}",
+        case_date_input = date_col.date_input(
+            "Case Date",
+            value=detected_case_date(processed_file),
+            key=f"dat_case_date_{st.session_state['dat_uploader_version']}",
         )
-        input_col2.caption("HH:MM")
+        split_choice = split_col.selectbox(
+            "Split this file?",
+            options=("No", "Yes"),
+            index=None,
+            placeholder="Choose",
+            key=f"dat_split_choice_{st.session_state['dat_uploader_version']}",
+        )
 
-        end_position1 = None
-        end_position2 = None
-        batch_signature_parts.append(
-            (
-                processed_file.filename,
-                processed_file.data_row_count,
-                end_position1_text.strip(),
-                end_position2_text.strip(),
+        position_ranges: list[PositionRange] = []
+        position_errors: list[str] = []
+        split_enabled = split_choice == "Yes"
+        if split_enabled:
+            position_count = st.number_input(
+                "Number of Positions",
+                min_value=MIN_DAT_POSITIONS,
+                max_value=MAX_DAT_POSITIONS,
+                value=3,
+                step=1,
+                key=f"dat_position_count_{st.session_state['dat_uploader_version']}",
             )
-        )
-        if end_position1_text or end_position2_text:
-            end_position1, error1 = parse_hhmm_time(end_position1_text)
-            end_position2, error2 = parse_hhmm_time(end_position2_text)
-            if error1:
-                validation_errors.append(f"{processed_file.filename}: End of Position 1 - {error1}")
-                st.error("End of Position 1: Please enter time in HH:MM format.")
-            if error2:
-                validation_errors.append(f"{processed_file.filename}: End of Position 2 - {error2}")
-                st.error("End of Position 2: Please enter time in HH:MM format.")
+            position_ranges, position_errors = collect_position_ranges(
+                int(position_count),
+                f"dat_position_{st.session_state['dat_uploader_version']}",
+            )
         else:
-            validation_errors.append(f"{processed_file.filename}: enter both cut times.")
-            st.warning("Enter both cut times before batch processing.")
+            position_count = 0
 
-        if end_position1 is not None and end_position2 is not None:
-            configured_files.append((processed_file, end_position1, end_position2))
-
-        with st.expander("Processing details", expanded=False):
-            st.markdown("Detected and renamed columns")
-            mapping_lines = [
-                f"`{original}` → `{clean}`"
-                for original, clean in processed_file.renamed_columns
-            ]
-            st.write(", ".join(mapping_lines))
-
-            if processed_file.removed_columns:
-                st.markdown("Removed columns")
-                st.write(", ".join(f"`{column}`" for column in processed_file.removed_columns))
+        if st.button("Process File", type="primary"):
+            if split_choice is None:
+                form_errors = ["Please choose whether this file should be split."]
+                case_number = None
             else:
-                st.markdown("Removed columns")
-                st.write("None of the standard removable columns were present.")
-
-        with st.expander("Preview cleaned data", expanded=False):
-            st.dataframe(
-                processed_file.cleaned_dataframe.loc[:, list(FINAL_COLUMNS)].head(PREVIEW_ROWS),
-                use_container_width=True,
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("## Batch Processing")
-    if validation_errors:
-        st.info("Enter valid HH:MM cut times for every uploaded DAT file before processing.")
-
-    batch_signature = tuple(batch_signature_parts)
-    process_clicked = st.button(
-        "Process All Files",
-        type="primary",
-        disabled=bool(validation_errors) or len(configured_files) != len(processed_files),
-    )
-
-    if process_clicked:
-        batch_outputs: list[DatBatchOutput] = []
-        batch_errors: list[str] = []
-        for processed_file, end_position1, end_position2 in configured_files:
-            batch_output, batch_error = build_dat_batch_output(
-                processed_file,
-                end_position1,
-                end_position2,
-            )
-            if batch_error:
-                batch_errors.append(f"{processed_file.filename}: {batch_error}")
-            elif batch_output:
-                batch_outputs.append(batch_output)
-
-        st.session_state["dat_batch_outputs"] = batch_outputs
-        st.session_state["dat_batch_errors"] = batch_errors
-        st.session_state["dat_batch_signature"] = batch_signature
-
-    batch_errors = st.session_state.get("dat_batch_errors", [])
-    batch_outputs = st.session_state.get("dat_batch_outputs", [])
-    previous_signature = st.session_state.get("dat_batch_signature")
-    show_upload_errors(batch_errors)
-
-    if batch_outputs and previous_signature != batch_signature:
-        st.info("Click Process All Files to regenerate outputs for the current files and cut times.")
-    elif batch_outputs:
-        st.markdown("## Results")
-        all_generated_files = []
-        for batch_output in batch_outputs:
-            st.markdown(f"### {batch_output.filename}")
-            render_split_result(batch_output.split_result)
-            all_generated_files.extend(batch_output.files)
-
-            button_cols = st.columns(4)
-            labels = ["Full XLSX", "Position 1", "Position 2", "Position 3"]
-            for button_col, label, output_file in zip(button_cols, labels, batch_output.files):
-                output_name, output_bytes = output_file
-                button_col.download_button(
-                    label=label,
-                    data=output_bytes,
-                    file_name=output_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dat_result_download_{batch_output.filename}_{output_name}",
+                case_number, form_errors = validate_case_inputs(
+                    case_no_input,
+                    case_date_input,
+                    split_enabled,
+                    int(position_count),
+                    position_ranges,
+                    position_errors,
                 )
 
-        st.download_button(
-            label="Download All",
-            data=build_xlsx_zip(all_generated_files),
-            file_name="processed_dat_files.zip",
-            mime="application/zip",
-            key="dat_download_all_batch_outputs",
-        )
+            for form_error in form_errors:
+                st.error(form_error)
+
+            if not form_errors and case_number is not None:
+                completed_case = None
+                process_error = None
+                with st.status(f"Processing C{case_number}...", expanded=True) as status:
+                    try:
+                        status.write("Reading DAT file...")
+                        status.write("Creating cleaned dataset...")
+                        status.write("Generating Full Dataset...")
+                        if split_enabled:
+                            status.write("Generating Position datasets...")
+                            status.write("Applying velocity transformations...")
+                        status.write("Creating XLSX and CSV outputs...")
+                        status.write("Running QC...")
+                        completed_case, process_error = build_completed_dat_case(
+                            processed_file,
+                            case_number,
+                            case_date_input,
+                            split_enabled,
+                            position_ranges,
+                        )
+                    except Exception as exc:
+                        process_error = str(exc)
+
+                    if process_error:
+                        status.update(
+                            label=f"Processing failed: {process_error}",
+                            state="error",
+                            expanded=True,
+                        )
+                    elif completed_case:
+                        status.write("Preparing downloads...")
+                        status.update(
+                            label="✓ Processing completed successfully.",
+                            state="complete",
+                            expanded=False,
+                        )
+
+                if process_error:
+                    st.error(process_error)
+                elif completed_case:
+                    st.session_state["dat_completed_cases"].append(completed_case)
+                    st.session_state["dat_current_result"] = completed_case
+                    st.rerun()
 
 
 def validate_identical_columns(datasets: list[UploadedDataset]) -> str | None:
@@ -721,6 +1107,7 @@ def main() -> None:
         page_title="Experimental Data Toolkit",
         layout="wide",
     )
+    inject_global_styles()
 
     st.title("Experimental Data Toolkit")
     st.caption("A lightweight web tool for routine experimental data processing.")

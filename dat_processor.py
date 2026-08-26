@@ -28,6 +28,41 @@ COLUMN_MAPPINGS: tuple[tuple[str, str], ...] = (
 
 REQUIRED_COLUMNS = tuple(original for original, _clean in COLUMN_MAPPINGS)
 FINAL_COLUMNS = tuple(clean for _original, clean in COLUMN_MAPPINGS)
+POSITION_CLEANED_COLUMNS = (
+    "TIMESTAMP",
+    "U1",
+    "V1",
+    "W1",
+    "Vx1",
+    "Vy1",
+    "Vz1",
+    "Temp1",
+    "U2",
+    "V2",
+    "W2",
+    "Vx2",
+    "Vy2",
+    "Vz2",
+    "Temp2",
+    "U3",
+    "V3",
+    "W3",
+    "Vx3",
+    "Vy3",
+    "Vz3",
+    "Temp3",
+)
+VELOCITY_COLUMNS = (
+    "Vx1",
+    "Vy1",
+    "Vz1",
+    "Vx2",
+    "Vy2",
+    "Vz2",
+    "Vx3",
+    "Vy3",
+    "Vz3",
+)
 REMOVED_COLUMNS = (
     "RECORD",
     "A_SensorStatus",
@@ -113,6 +148,51 @@ def clean_dat_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
     cleaned = selected.rename(columns=dict(COLUMN_MAPPINGS)).loc[:, list(FINAL_COLUMNS)]
     cleaned["TIMESTAMP"] = parse_timestamp_column(cleaned["TIMESTAMP"])
     return cleaned
+
+
+def velocity_transform_description(position_number: int) -> str:
+    if position_number in (1, 2, 3):
+        return "Velocity transform: Vx = W, Vy = -U, Vz = -V"
+    if position_number in (4, 5, 6):
+        return "Velocity transform: Vx = -W, Vy = U, Vz = -V"
+    raise ValueError("Velocity transformation is defined only for Positions 1 through 6.")
+
+
+def add_transformed_velocity_columns(
+    dataframe: pd.DataFrame,
+    position_number: int,
+) -> pd.DataFrame:
+    """Add position-specific velocity components beside each sensor's U/V/W columns."""
+    if position_number not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("Velocity transformation is defined only for Positions 1 through 6.")
+
+    missing_columns = [
+        column
+        for column in FINAL_COLUMNS
+        if column not in dataframe.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Cannot add transformed velocity columns because required cleaned "
+            f"columns are missing: {', '.join(missing_columns)}"
+        )
+
+    transformed = dataframe.copy()
+    first_rule = position_number in (1, 2, 3)
+
+    for sensor_number in (1, 2, 3):
+        u_column = f"U{sensor_number}"
+        v_column = f"V{sensor_number}"
+        w_column = f"W{sensor_number}"
+        transformed[f"Vx{sensor_number}"] = (
+            transformed[w_column] if first_rule else -transformed[w_column]
+        )
+        transformed[f"Vy{sensor_number}"] = (
+            -transformed[u_column] if first_rule else transformed[u_column]
+        )
+        transformed[f"Vz{sensor_number}"] = -transformed[v_column]
+
+    return transformed.loc[:, list(POSITION_CLEANED_COLUMNS)]
 
 
 def parse_timestamp_column(series: pd.Series) -> pd.Series:
