@@ -13,9 +13,11 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import analysis_processor as analysis
 import dat_batch
 import dat_processor as dat
 import time_splitter as splitter
+import vertical_profile_processor as vertical
 
 
 def make_workbook_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -40,6 +42,16 @@ def analyze_dataframe(dataframe: pd.DataFrame, filename: str = "P1_Round1.xlsx")
     analysis = splitter.analyze_workbook_bytes(workbook_bytes, filename)
     assert analysis.errors == []
     return analysis
+
+
+def duration_range(label: str, start_time: time, duration_minutes: int) -> splitter.PositionRange:
+    position_range, error = splitter.build_position_range_from_duration(
+        label,
+        start_time,
+        duration_minutes,
+    )
+    assert error is None
+    return position_range
 
 
 def assert_position_conditions(result, boundary1, boundary2):
@@ -508,6 +520,123 @@ def test_hhmm_parts_reconstruct_to_position_range_times():
     assert end_time == time(12, 45)
 
 
+def test_start_time_options_use_dataset_minute_range():
+    options = splitter.generate_minute_time_options(
+        pd.Timestamp("2026-08-26 12:34:46"),
+        pd.Timestamp("2026-08-26 13:03:59"),
+    )
+    assert options[0] == time(12, 34)
+    assert options[-1] == time(13, 3)
+    assert options[1] == time(12, 35)
+    assert len(options) == 30
+
+
+def test_duration_options_and_validation():
+    assert splitter.duration_options() == list(range(46))
+    assert splitter.format_duration_option(5) == "5 min"
+    position_range, error = splitter.build_position_range_from_duration(
+        "P01",
+        time(12, 40),
+        5,
+    )
+    assert error is None
+    assert position_range.start_time == time(12, 40)
+    assert position_range.duration_minutes == 5
+    assert position_range.end_time == time(12, 45)
+    assert position_range.end_is_exclusive
+
+    position_range, error = splitter.build_position_range_from_duration(
+        "P02",
+        time(12, 40),
+        0,
+    )
+    assert position_range is None
+    assert error == "Please select a duration greater than 0 minutes for P02."
+
+    assert splitter.build_position_range_from_duration("P03", time(12, 40), 1)[1] is None
+    assert splitter.build_position_range_from_duration("P04", time(12, 40), 45)[1] is None
+
+
+def test_duration_range_uses_half_open_interval():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": [
+                "2026-08-26 12:39:59.999",
+                "2026-08-26 12:40:00",
+                "2026-08-26 12:40:00.020",
+                "2026-08-26 12:44:59.970",
+                "2026-08-26 12:45:00",
+                "2026-08-26 12:45:00.020",
+            ],
+            "U1": range(6),
+        }
+    )
+    analysis = analyze_dataframe(dataframe)
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [duration_range("P01", time(12, 40), 5)],
+        ["C03_P01_26.08.26.xlsx"],
+    )
+    assert error is None
+    workbook = pd.read_excel(BytesIO(result.output_files[0][1]), sheet_name=None, engine="openpyxl")
+    split_frame = workbook["Cleaned_Data"]
+    assert list(split_frame["U1"]) == [1, 2, 3]
+
+
+def test_duration_range_extending_beyond_dataset_is_rejected():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": [
+                "2026-08-26 12:34:46",
+                "2026-08-26 13:03:59",
+            ]
+        }
+    )
+    analysis = analyze_dataframe(dataframe)
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [duration_range("P03", time(13, 0), 10)],
+        ["C03_P03_26.08.26.xlsx"],
+    )
+    assert result is None
+    assert error == (
+        "P03 extends beyond the available data range. "
+        "Please choose an earlier Start Time or shorter Duration."
+    )
+
+
+def test_duration_range_empty_position_is_rejected():
+    dataframe = pd.DataFrame(
+        {"TIMESTAMP": ["2026-08-26 13:00:00", "2026-08-26 14:00:00"]}
+    )
+    analysis = analyze_dataframe(dataframe)
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [duration_range("P01", time(13, 30), 5)],
+        ["C03_P01_26.08.26.xlsx"],
+    )
+    assert result is None
+    assert error == "P01: requested range contains no observations."
+
+
+def test_duration_range_adjacent_positions_are_valid():
+    dataframe = pd.DataFrame(
+        {"TIMESTAMP": pd.date_range("2026-08-26 12:40:00", periods=11, freq="1min")}
+    )
+    analysis = analyze_dataframe(dataframe)
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [
+            duration_range("P01", time(12, 40), 5),
+            duration_range("P02", time(12, 45), 5),
+        ],
+        ["C03_P01_26.08.26.xlsx", "C03_P02_26.08.26.xlsx"],
+    )
+    assert error is None
+    assert [summary.rows for summary in result.position_summaries] == [5, 5]
+    assert result.qc_results[0].no_duplicate_assignments
+
+
 def test_integrated_dat_batch_output_contains_xlsx_and_csv_files():
     app = load_app_module()
     processed, error = dat.process_dat_bytes(sample_dat_text().encode("utf-8"), "P1_Round1.dat")
@@ -518,9 +647,9 @@ def test_integrated_dat_batch_output_contains_xlsx_and_csv_files():
         pd.Timestamp("2026-08-26").date(),
         True,
         [
-            splitter.PositionRange("P01", time(16, 39), time(16, 39)),
-            splitter.PositionRange("P02", time(16, 40), time(16, 40)),
-            splitter.PositionRange("P03", time(16, 41), time(16, 41)),
+            duration_range("P01", time(16, 39), 1),
+            duration_range("P02", time(16, 40), 1),
+            duration_range("P03", time(16, 41), 1),
         ],
     )
     assert batch_error is None
@@ -554,9 +683,9 @@ def test_integrated_dat_positions_have_transformed_cleaned_data_only():
         pd.Timestamp("2026-08-26").date(),
         True,
         [
-            splitter.PositionRange("P01", time(16, 39), time(16, 39)),
-            splitter.PositionRange("P02", time(16, 40), time(16, 40)),
-            splitter.PositionRange("P03", time(16, 41), time(16, 41)),
+            duration_range("P01", time(16, 39), 1),
+            duration_range("P02", time(16, 40), 1),
+            duration_range("P03", time(16, 41), 1),
         ],
     )
     assert process_error is None
@@ -590,9 +719,9 @@ def test_dat_full_and_position_csv_content_rules():
         pd.Timestamp("2026-08-26").date(),
         True,
         [
-            splitter.PositionRange("P01", time(16, 39), time(16, 39)),
-            splitter.PositionRange("P02", time(16, 40), time(16, 40)),
-            splitter.PositionRange("P03", time(16, 41), time(16, 41)),
+            duration_range("P01", time(16, 39), 1),
+            duration_range("P02", time(16, 40), 1),
+            duration_range("P03", time(16, 41), 1),
         ],
     )
     assert process_error is None
@@ -633,10 +762,10 @@ def test_dat_p04_csv_uses_second_transform_rule():
         pd.Timestamp("2026-08-26").date(),
         True,
         [
-            splitter.PositionRange("P01", time(16, 39), time(16, 39)),
-            splitter.PositionRange("P02", time(16, 40), time(16, 40)),
-            splitter.PositionRange("P03", time(16, 41), time(16, 41)),
-            splitter.PositionRange("P04", time(16, 42), time(16, 42)),
+            duration_range("P01", time(16, 39), 1),
+            duration_range("P02", time(16, 40), 1),
+            duration_range("P03", time(16, 41), 1),
+            duration_range("P04", time(16, 42), 1),
         ],
     )
     assert process_error is None
@@ -656,9 +785,9 @@ def test_current_case_zip_contains_xlsx_and_csv_without_raw_csv():
         pd.Timestamp("2026-08-26").date(),
         True,
         [
-            splitter.PositionRange("P01", time(16, 39), time(16, 39)),
-            splitter.PositionRange("P02", time(16, 40), time(16, 40)),
-            splitter.PositionRange("P03", time(16, 41), time(16, 41)),
+            duration_range("P01", time(16, 39), 1),
+            duration_range("P02", time(16, 40), 1),
+            duration_range("P03", time(16, 41), 1),
         ],
     )
     assert process_error is None
@@ -693,9 +822,9 @@ def test_integrated_dat_batch_many_files_zip_generation():
             pd.Timestamp("2026-08-26").date(),
             True,
             [
-                splitter.PositionRange("P01", time(16, 39), time(16, 39)),
-                splitter.PositionRange("P02", time(16, 40), time(16, 40)),
-                splitter.PositionRange("P03", time(16, 41), time(16, 41)),
+                duration_range("P01", time(16, 39), 1),
+                duration_range("P02", time(16, 40), 1),
+                duration_range("P03", time(16, 41), 1),
             ],
         )
         assert batch_error is None
@@ -764,7 +893,7 @@ def split_with_position_count(position_count: int):
     dataframe = build_long_case_dataframe()
     analysis = analyze_dataframe(dataframe, "C03_All_26.08.26.xlsx")
     ranges = [
-        splitter.PositionRange(f"P{index + 1:02d}", time(13, index * 2), time(13, index * 2))
+        duration_range(f"P{index + 1:02d}", time(13, index * 2), 1)
         for index in range(position_count)
     ]
     filenames = [
@@ -942,11 +1071,11 @@ def test_case_validation_reports_incomplete_positions():
         True,
         3,
         [splitter.PositionRange("P01", time(13, 0), time(13, 30))],
-        ["Please enter P02 Start Hour."],
+        ["Please select a duration greater than 0 minutes for P02."],
     )
     assert case_number == "03"
-    assert "Please enter Start Time and End Time for all Positions." in errors
-    assert "Please enter P02 Start Hour." in errors
+    assert "Please select Start Time and Duration for all Positions." in errors
+    assert "Please select a duration greater than 0 minutes for P02." in errors
 
 
 def test_dat_workflow_source_has_no_empty_edt_card_placeholder():
@@ -999,15 +1128,20 @@ def test_dat_workflow_source_has_processing_status_messages():
     assert "Processing failed: {process_error}" in app_source
 
 
-def test_dat_workflow_source_uses_separate_hh_mm_inputs():
+def test_dat_workflow_source_uses_start_time_and_duration_inputs():
     app_source = (PROJECT_ROOT / "app.py").read_text()
-    assert "Start HH" in app_source
-    assert "Start MM" in app_source
-    assert "End HH" in app_source
-    assert "End MM" in app_source
-    assert "build_time_range_from_parts" in app_source
-    assert "placeholder=\"HH\"" in app_source
-    assert "placeholder=\"MM\"" in app_source
+    assert "Start Time" in app_source
+    assert "Duration (min)" in app_source
+    assert "Calculated End" in app_source
+    assert "generate_minute_time_options" in app_source
+    assert "duration_options" in app_source
+    assert "build_position_range_from_duration" in app_source
+    assert "Start HH" not in app_source
+    assert "Start MM" not in app_source
+    assert "End HH" not in app_source
+    assert "End MM" not in app_source
+    assert "placeholder=\"HH\"" not in app_source
+    assert "placeholder=\"MM\"" not in app_source
 
 
 def test_current_result_survives_session_state_rerun():
@@ -1102,6 +1236,643 @@ def test_existing_merge_csv_still_works():
     assert len(merged) == 3
 
 
+def analysis_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Vx1": [1.0, 3.0],
+            "Vy1": [2.0, 4.0],
+            "Vz1": [2.0, 4.0],
+            "Vx2": [0.0, 2.0],
+            "Vy2": [0.0, 2.0],
+            "Vz2": [1.0, 3.0],
+            "Vx3": [-1.0, -3.0],
+            "Vy3": [1.0, 3.0],
+            "Vz3": [2.0, 2.0],
+        }
+    )
+
+
+def test_analysis_csv_validation_and_mean_vectors():
+    dataframe = analysis_dataframe()
+    assert analysis.validate_analysis_csv(dataframe, "air.csv") is None
+    missing_error = analysis.validate_analysis_csv(
+        dataframe.drop(columns=["Vz3"]),
+        "bad.csv",
+    )
+    assert missing_error == "bad.csv is missing required airflow columns: Vz3"
+    assert analysis.validate_heights([0, 4.25, 8.75]) is None
+    assert analysis.validate_heights([0, 9, 4]) == "Height 2 must be between 0 and 8.75 ft."
+
+    means = analysis.compute_mean_vectors(dataframe)
+    assert means[0].vx == 2.0
+    assert means[0].vy == 3.0
+    assert means[0].vz == 3.0
+    assert round(means[0].magnitude, 6) == round((2.0**2 + 3.0**2 + 3.0**2) ** 0.5, 6)
+
+
+def test_analysis_vector_records_coordinates_and_duplicates():
+    means = analysis.compute_mean_vectors(analysis_dataframe())
+    records = analysis.build_vector_records(4, [1.0, 4.0, 7.0], means, "p4.csv")
+    assert [(record.x, record.y) for record in records] == [(5.33, 2.5)] * 3
+    assert [record.z for record in records] == [1.0, 4.0, 7.0]
+    assert records[0].position_number == 4
+    assert records[0].height_index == 1
+    duplicate_errors = analysis.duplicate_position_height_errors(
+        records,
+        analysis.build_vector_records(4, [1.0, 5.0, 8.0], means, "p4_again.csv"),
+    )
+    assert duplicate_errors == [
+        "P4-H1 duplicates an existing position + height combination at 1 ft."
+    ]
+    within_upload_errors = analysis.duplicate_position_height_errors(
+        [],
+        analysis.build_vector_records(2, [1.0, 1.0, 8.0], means, "p2.csv"),
+    )
+    assert within_upload_errors == [
+        "P2-H2 duplicates another height in this upload at 1 ft."
+    ]
+
+
+def test_analysis_display_vectors_are_normalized_without_changing_true_values():
+    records = [
+        analysis.VectorRecord(1, 1, 2.67, 2.5, 1.0, 0.3, 0.4, 0.0, 0.5, "p1.csv"),
+        analysis.VectorRecord(1, 2, 2.67, 2.5, 4.0, 0.0, 0.0, 0.0, 0.0, "p1.csv"),
+    ]
+    display_us, display_vs, display_ws = analysis.display_vector_components(records, "imperial")
+    max_length = max(analysis.room_dimensions("imperial")) * analysis.MAX_ARROW_LENGTH_FRACTION
+    assert round(display_us[0], 6) == round(0.6 * max_length, 6)
+    assert round(display_vs[0], 6) == round(0.8 * max_length, 6)
+    assert display_ws[0] == 0.0
+    assert (display_us[1], display_vs[1], display_ws[1]) == (0.0, 0.0, 0.0)
+
+    summary = analysis.vector_records_to_dataframe(records, "si")
+    assert summary.loc[0, "Mean Vx (m/s)"] == 0.3
+    assert summary.loc[0, "Mean Vy (m/s)"] == 0.4
+    assert summary.loc[0, "Mean Vz (m/s)"] == 0.0
+    assert summary.loc[0, "Velocity magnitude (m/s)"] == 0.5
+
+
+def test_analysis_si_and_imperial_unit_conversions_are_correct():
+    record = analysis.VectorRecord(6, 3, 5.33, 7.5, 8.75, 0.3, -0.4, 0.5, (0.3**2 + 0.4**2 + 0.5**2) ** 0.5, "p6.csv")
+    assert analysis.room_dimensions("imperial") == (8.0, 10.0, 8.75)
+    assert tuple(round(value, 6) for value in analysis.room_dimensions("si")) == (2.4384, 3.048, 2.667)
+    assert analysis.position_to_xy_in_units(1, "imperial") == (2.67, 2.5)
+    assert analysis.position_to_xy_in_units(6, "imperial") == (5.33, 7.5)
+    assert analysis.position_to_xy_in_units(1, "si") == (2.67 * 0.3048, 2.5 * 0.3048)
+    assert analysis.position_to_xy_in_units(6, "si") == (5.33 * 0.3048, 7.5 * 0.3048)
+
+    si_values = analysis.converted_record_values(record, "si")
+    imperial_values = analysis.converted_record_values(record, "imperial")
+    assert si_values["z"] == 8.75 * 0.3048
+    assert imperial_values["z"] == 8.75
+    assert imperial_values["vx"] == 0.3 * analysis.M_PER_S_TO_FT_PER_S
+    assert imperial_values["vy"] == -0.4 * analysis.M_PER_S_TO_FT_PER_S
+    assert imperial_values["vz"] == 0.5 * analysis.M_PER_S_TO_FT_PER_S
+    assert round(imperial_values["magnitude"], 12) == round(record.magnitude * analysis.M_PER_S_TO_FT_PER_S, 12)
+    assert analysis.direction_matches_after_unit_conversion(record)
+
+
+def test_analysis_si_and_imperial_display_scaling_is_equivalent():
+    records = [
+        analysis.VectorRecord(1, 1, 2.67, 2.5, 1.0, 0.1, 0.0, 0.0, 0.1, "p1.csv"),
+        analysis.VectorRecord(2, 1, 2.67, 5.0, 2.0, 0.0, 0.2, 0.0, 0.2, "p2.csv"),
+    ]
+    imperial_us, imperial_vs, imperial_ws = analysis.display_vector_components(records, "imperial")
+    si_us, si_vs, si_ws = analysis.display_vector_components(records, "si")
+    for imperial_component, si_component in zip(
+        imperial_us + imperial_vs + imperial_ws,
+        si_us + si_vs + si_ws,
+    ):
+        assert round(si_component, 12) == round(imperial_component * analysis.FT_TO_M, 12)
+
+
+def test_analysis_position_coordinates_are_exact_and_not_swapped():
+    expected = {
+        1: (2.67, 2.5),
+        2: (2.67, 5.0),
+        3: (2.67, 7.5),
+        4: (5.33, 2.5),
+        5: (5.33, 5.0),
+        6: (5.33, 7.5),
+    }
+    analysis.validate_position_coordinates()
+    assert analysis.POSITION_COORDINATES == expected
+    assert [analysis.position_to_xy(position)[0] for position in (1, 2, 3)] == [2.67, 2.67, 2.67]
+    assert [analysis.position_to_xy(position)[0] for position in (4, 5, 6)] == [5.33, 5.33, 5.33]
+    assert [analysis.position_to_xy(position)[1] for position in (1, 2, 3)] == [2.5, 5.0, 7.5]
+    assert [analysis.position_to_xy(position)[1] for position in (4, 5, 6)] == [2.5, 5.0, 7.5]
+
+
+def test_analysis_plot_source_uses_velocity_colormap_colorbar_and_no_position_labels():
+    source = (PROJECT_ROOT / "analysis_processor.py").read_text()
+    assert "POSITION_COLORS" not in source
+    assert "VELOCITY_COLORMAP = \"turbo\"" in source
+    assert "fig.colorbar" in source
+    assert "colorbar.set_label(f\"Velocity magnitude ({unit_spec.velocity_unit})\")" in source
+    assert "display_vector_components(vector_records, unit_system)" in source
+    assert "MAX_ARROW_LENGTH_FRACTION" in source
+    assert "ax.set_proj_type(\"ortho\")" in source
+    assert "VIEW_ELEVATION" in source
+    assert "VIEW_AZIMUTH" in source
+    assert "VIEW_ROLL" in source
+    assert "apply_matplotlib_camera(ax, elevation, azimuth, roll)" in source
+    assert "plot_interactive_air_vectors" in source
+    assert "camera_eye_from_angles" in source
+    assert "show_vector_labels: bool = False" in source
+    assert "| |V| =" not in source
+    assert "ax.text(" not in source
+    assert "mode=\"markers+text\"" not in source
+    assert "Vector origins" in source
+    assert "floor_x" not in source
+    assert "floor_y" not in source
+    assert "floor_z" not in source
+    assert "Colors identify measurement positions" not in source
+    assert "Colors indicate velocity magnitude" in source
+
+
+def test_analysis_camera_defaults_and_helpers():
+    assert analysis.VIEW_AZIMUTH == 10
+    assert analysis.VIEW_ELEVATION == 15
+    assert analysis.VIEW_ROLL == 0
+    eye = analysis.camera_eye_from_angles(10, 15)
+    assert set(eye) == {"x", "y", "z"}
+    assert round((eye["x"] ** 2 + eye["y"] ** 2 + eye["z"] ** 2) ** 0.5, 6) == 1.85
+    assert analysis.camera_up_from_roll(0) == {"x": 0.0, "y": 0.0, "z": 1.0}
+
+
+def test_analysis_plot_exports_eps_and_png():
+    if importlib.util.find_spec("matplotlib") is None:
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text()
+        assert "matplotlib" in requirements
+        return
+
+    means = analysis.compute_mean_vectors(analysis_dataframe())
+    records = analysis.build_vector_records(1, [1.0, 4.0, 7.0], means, "p1.csv")
+    si_fig = analysis.plot_3d_air_vectors(records, "si", azimuth=15, elevation=35, roll=5)
+    imperial_fig = analysis.plot_3d_air_vectors(records, "imperial", azimuth=15, elevation=35, roll=5)
+    si_eps_bytes = analysis.export_figure_eps(si_fig)
+    si_png_bytes = analysis.export_figure_png(si_fig)
+    imperial_eps_bytes = analysis.export_figure_eps(imperial_fig)
+    imperial_png_bytes = analysis.export_figure_png(imperial_fig)
+    assert si_eps_bytes.startswith(b"%!PS-Adobe")
+    assert si_png_bytes.startswith(b"\x89PNG")
+    assert imperial_eps_bytes.startswith(b"%!PS-Adobe")
+    assert imperial_png_bytes.startswith(b"\x89PNG")
+
+
+def test_analysis_interactive_plot_dependency_is_declared_or_available():
+    if importlib.util.find_spec("plotly") is None:
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text()
+        assert "plotly" in requirements
+        return
+
+    means = analysis.compute_mean_vectors(analysis_dataframe())
+    records = analysis.build_vector_records(1, [1.0, 4.0, 7.0], means, "p1.csv")
+    fig = analysis.plot_interactive_air_vectors(records, "si", 10, 15, 0)
+    assert fig.layout.scene.camera.projection.type == "orthographic"
+    assert fig.layout.scene.xaxis.title.text == "X (m)"
+    assert "Velocity magnitude (m/s)" in str(fig.to_dict())
+    assert "markers+text" not in str(fig.to_dict())
+
+
+def test_interactive_origin_markers_match_vector_start_points():
+    if importlib.util.find_spec("plotly") is None:
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text()
+        assert "plotly" in requirements
+        return
+
+    means = analysis.compute_mean_vectors(analysis_dataframe())
+    records = analysis.build_vector_records(4, [1.0, 4.0, 7.0], means, "p4.csv")
+    fig = analysis.plot_interactive_air_vectors(records, "imperial", 10, 15, 0)
+    origin_trace = [
+        trace for trace in fig.data
+        if getattr(trace, "name", None) == "Vector origins"
+    ][0]
+    assert list(origin_trace.x) == [record.x for record in records]
+    assert list(origin_trace.y) == [record.y for record in records]
+    assert list(origin_trace.z) == [record.z for record in records]
+
+
+def vertical_profile_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Vx1": [3.0, 0.0],
+            "Vy1": [4.0, 0.0],
+            "Vz1": [0.0, 0.0],
+            "Vx2": [0.0, 0.0],
+            "Vy2": [0.0, 6.0],
+            "Vz2": [0.0, 8.0],
+            "Vx3": [1.0, 2.0],
+            "Vy3": [2.0, 2.0],
+            "Vz3": [2.0, 1.0],
+            "Temp1": [20.0, 22.0],
+            "Temp2": [24.0, 26.0],
+            "Temp3": [28.0, 30.0],
+            "T_low": [21.0, 23.0],
+            "T_mid": [25.0, 27.0],
+            "T_high": [29.0, 31.0],
+            "CO2_A": [400.0, 500.0],
+            "CO2_B": [600.0, 700.0],
+            "CO2_C": [800.0, 900.0],
+        }
+    )
+
+
+def test_vertical_velocity_profile_averages_instantaneous_speed():
+    profile, errors = vertical.compute_air_speed_profile(vertical_profile_dataframe())
+    assert errors == []
+    assert profile[0][0] == 2.5
+    assert profile[1][0] == 5.0
+    expected_h3 = (((1.0**2 + 2.0**2 + 2.0**2) ** 0.5) + ((2.0**2 + 2.0**2 + 1.0**2) ** 0.5)) / 2
+    assert profile[2][0] == expected_h3
+
+
+def test_vertical_normalization_formulas_do_not_clip_values():
+    assert vertical.normalize_height(4.375, 8.75) == 0.5
+    assert vertical.normalize_velocity(2.0, 0.5) == 4.0
+    assert vertical.normalize_temperature(30.0, 20.0, 25.0) == 2.0
+    assert vertical.normalize_concentration(350.0, 400.0, 500.0) == -0.5
+
+
+def test_vertical_temperature_auto_and_manual_mapping():
+    dataframe = vertical_profile_dataframe()
+    assert vertical.default_temperature_columns(dataframe) == ["Temp1", "Temp2", "Temp3"]
+    auto_profile, auto_errors = vertical.compute_temperature_profile(dataframe, ["Temp1", "Temp2", "Temp3"])
+    manual_profile, manual_errors = vertical.compute_temperature_profile(dataframe, ["T_low", "T_mid", "T_high"])
+    assert auto_errors == []
+    assert manual_errors == []
+    assert [stat[0] for stat in auto_profile] == [21.0, 25.0, 29.0]
+    assert [stat[0] for stat in manual_profile] == [22.0, 26.0, 30.0]
+
+
+def test_vertical_contaminant_mapping_unit_and_summary():
+    records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        2,
+        [2.0, 4.0, 6.0],
+        ["Contaminant Concentration"],
+        "Normalized Profiles",
+        8.75,
+        "p2.csv",
+        contaminant_columns=["CO2_A", "CO2_B", "CO2_C"],
+        contaminant_name="CO2",
+        concentration_unit="ppm",
+        cin=400.0,
+        cout=800.0,
+    )
+    assert errors == []
+    assert len(records) == 3
+    assert records[0].unit == "ppm"
+    assert records[0].contaminant_name == "CO2"
+    summary = vertical.vertical_profile_records_to_dataframe(records)
+    assert "Normalized Value" in summary.columns
+    assert list(summary["Source Column"]) == ["CO2_A", "CO2_B", "CO2_C"]
+
+
+def test_vertical_build_records_for_three_variables_and_height_order():
+    records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        1,
+        [6.0, 2.0, 4.0],
+        ["Air Velocity", "Temperature", "Contaminant Concentration"],
+        "Normalized Profiles",
+        8.75,
+        "p1.csv",
+        supply_velocity=2.5,
+        temperature_columns=["Temp1", "Temp2", "Temp3"],
+        tin=20.0,
+        tout=25.0,
+        contaminant_columns=["CO2_A", "CO2_B", "CO2_C"],
+        contaminant_name="Tracer gas",
+        concentration_unit="ppm",
+        cin=400.0,
+        cout=800.0,
+    )
+    assert errors == []
+    assert len(records) == 9
+    velocity_records = [record for record in records if record.variable == "Air Velocity"]
+    assert [record.height_ft for record in velocity_records] == [2.0, 4.0, 6.0]
+    assert velocity_records[0].normalized_value == 5.0 / 2.5
+
+
+def test_vertical_profile_variables_can_use_independent_source_files():
+    velocity_frame = vertical_profile_dataframe()[["Vx1", "Vy1", "Vz1", "Vx2", "Vy2", "Vz2", "Vx3", "Vy3", "Vz3"]]
+    temperature_frame = vertical_profile_dataframe()[["T_low", "T_mid", "T_high"]]
+    contaminant_frame = vertical_profile_dataframe()[["CO2_A", "CO2_B", "CO2_C"]]
+    records, errors = vertical.build_vertical_profile_records_from_sources(
+        {
+            "Air Velocity": velocity_frame,
+            "Temperature": temperature_frame,
+            "Contaminant Concentration": contaminant_frame,
+        },
+        {
+            "Air Velocity": "velocity.csv",
+            "Temperature": "temperature.csv",
+            "Contaminant Concentration": "contaminant.csv",
+        },
+        "Experimental",
+        3,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity", "Temperature", "Contaminant Concentration"],
+        "Normalized Profiles",
+        8.75,
+        supply_velocity=2.5,
+        temperature_columns=["T_low", "T_mid", "T_high"],
+        tin=20.0,
+        tout=30.0,
+        contaminant_columns=["CO2_A", "CO2_B", "CO2_C"],
+        contaminant_name="CO2",
+        concentration_unit="ppm",
+        cin=400.0,
+        cout=900.0,
+    )
+    assert errors == []
+    assert len(records) == 9
+    assert {record.source_file for record in records if record.variable == "Air Velocity"} == {"velocity.csv"}
+    assert {record.source_file for record in records if record.variable == "Temperature"} == {"temperature.csv"}
+    assert {record.source_file for record in records if record.variable == "Contaminant Concentration"} == {"contaminant.csv"}
+
+    unified = vertical.vertical_profile_records_to_unified_dataframe(
+        records,
+        ["Air Velocity", "Temperature", "Contaminant Concentration"],
+    )
+    assert len(unified) == 3
+    assert list(unified["Position"]) == ["P3", "P3", "P3"]
+    assert "Air Velocity Mean" in unified.columns
+    assert "Temperature Mean" in unified.columns
+    assert "Contaminant Concentration Mean" in unified.columns
+    assert list(unified["Air Velocity Source File"]) == ["velocity.csv"] * 3
+    assert list(unified["Temperature Source File"]) == ["temperature.csv"] * 3
+    assert list(unified["Contaminant Concentration Source File"]) == ["contaminant.csv"] * 3
+
+
+def test_vertical_profile_missing_selected_variable_remains_blank_in_unified_summary():
+    records, errors = vertical.build_vertical_profile_records_from_sources(
+        {"Air Velocity": vertical_profile_dataframe()[["Vx1", "Vy1", "Vz1", "Vx2", "Vy2", "Vz2", "Vx3", "Vy3", "Vz3"]]},
+        {"Air Velocity": "velocity.csv"},
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity", "Temperature"],
+        "Normalized Profiles",
+        8.75,
+        supply_velocity=2.5,
+        tin=20.0,
+        tout=30.0,
+    )
+    assert errors == []
+    assert {record.variable for record in records} == {"Air Velocity"}
+    unified = vertical.vertical_profile_records_to_unified_dataframe(records, ["Air Velocity", "Temperature"])
+    assert len(unified) == 3
+    assert unified["Temperature Mean"].isna().all()
+    assert unified["Temperature Source File"].isna().all()
+
+
+def test_vertical_validation_rejects_missing_inputs_and_future_cfd():
+    errors = vertical.validate_profile_heights([0, 9], 8.75)
+    assert "Height 1 must be greater than 0 ft." in errors
+    assert "Height 2 must be less than or equal to the room height." in errors
+    norm_errors = vertical.validate_normalization_inputs(
+        ["Air Velocity", "Temperature", "Contaminant Concentration"],
+        "Normalized Profiles",
+        supply_velocity=0,
+        tin=20,
+        tout=20,
+        cin=1,
+        cout=1,
+    )
+    assert "Supply Air Velocity Us must be greater than 0 m/s." in norm_errors
+    assert "Tout must not equal Tin for normalized temperature." in norm_errors
+    assert "Cout must not equal Cin for normalized concentration." in norm_errors
+    _records, cfd_errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "CFD",
+        1,
+        [1, 2, 3],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+        "cfd.csv",
+    )
+    assert cfd_errors == ["CFD input support is reserved for a future update."]
+
+
+def test_vertical_plot_exports_and_zip():
+    records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity", "Temperature"],
+        "Raw Profiles",
+        8.75,
+        "p1.csv",
+        temperature_columns=["Temp1", "Temp2", "Temp3"],
+    )
+    assert errors == []
+    if importlib.util.find_spec("matplotlib") is None:
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text()
+        assert "matplotlib" in requirements
+    else:
+        fig = vertical.plot_vertical_profiles(records, ["Air Velocity", "Temperature"], "Raw Profiles")
+        eps_bytes = vertical.export_vertical_profile_eps(fig)
+        png_bytes = vertical.export_vertical_profile_png(fig)
+        assert eps_bytes.startswith(b"%!PS-Adobe")
+        assert png_bytes.startswith(b"\x89PNG")
+    csv_bytes = vertical.vertical_profile_summary_csv(records)
+    xlsx_bytes = vertical.vertical_profile_summary_xlsx(records)
+    zip_bytes = vertical.build_vertical_profile_zip(
+        [
+            ("Vertical_Profile_Raw.eps", b"eps"),
+            ("Vertical_Profile_Raw.png", b"png"),
+            ("Vertical_Profile_Summary.csv", csv_bytes),
+            ("Vertical_Profile_Summary.xlsx", xlsx_bytes),
+        ]
+    )
+    with ZipFile(BytesIO(zip_bytes)) as archive:
+        assert set(archive.namelist()) == {
+            "Vertical_Profile_Raw.eps",
+            "Vertical_Profile_Raw.png",
+            "Vertical_Profile_Summary.csv",
+            "Vertical_Profile_Summary.xlsx",
+        }
+
+
+def test_vertical_plot_uses_separate_figure_title_and_shared_legend():
+    records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity", "Temperature", "Contaminant Concentration"],
+        "Normalized Profiles",
+        8.75,
+        "p1.csv",
+        supply_velocity=2.5,
+        temperature_columns=["Temp1", "Temp2", "Temp3"],
+        tin=20.0,
+        tout=25.0,
+        contaminant_columns=["CO2_A", "CO2_B", "CO2_C"],
+        contaminant_name="CO2",
+        concentration_unit="ppm",
+        cin=400.0,
+        cout=800.0,
+    )
+    assert errors == []
+    if importlib.util.find_spec("matplotlib") is None:
+        return
+
+    fig = vertical.plot_vertical_profiles(
+        records,
+        ["Air Velocity", "Temperature", "Contaminant Concentration"],
+        "Normalized Profiles",
+        "CO2",
+        "ppm",
+    )
+    assert fig._suptitle.get_text() == "Normalized Vertical Profiles"
+    assert len(fig.legends) == 1
+    assert [text.get_text() for text in fig.legends[0].texts] == ["P1"]
+    assert all(axis.get_legend() is None for axis in fig.axes)
+    assert [axis.get_title() for axis in fig.axes] == [
+        "Air Velocity",
+        "Temperature",
+        "CO2 Concentration",
+    ]
+    assert vertical.export_vertical_profile_eps(fig).startswith(b"%!PS-Adobe")
+    assert vertical.export_vertical_profile_png(fig).startswith(b"\x89PNG")
+
+
+def test_app_data_analysis_outputs_include_si_imperial_and_zip_files():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    expected_names = [
+        "3D_Air_Velocity_SI.eps",
+        "3D_Air_Velocity_SI.png",
+        "3D_Air_Velocity_Imperial.eps",
+        "3D_Air_Velocity_Imperial.png",
+        "Air_Velocity_Summary_SI.csv",
+        "Air_Velocity_Summary_SI.xlsx",
+        "Air_Velocity_Summary_Imperial.csv",
+        "Air_Velocity_Summary_Imperial.xlsx",
+    ]
+    for expected_name in expected_names:
+        assert expected_name in app_source
+    assert "Download All Analysis Files (ZIP)" in app_source
+    assert "plot_3d_air_vectors(vector_records, \"si\", azimuth, elevation, roll)" in app_source
+    assert "plot_3d_air_vectors(vector_records, \"imperial\", azimuth, elevation, roll)" in app_source
+
+
+def test_app_data_analysis_camera_controls_are_present():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    assert "ANALYSIS_CAMERA_DEFAULTS" in app_source
+    assert "render_analysis_camera_controls" in app_source
+    assert "Azimuth (deg)" in app_source
+    assert "Elevation (deg)" in app_source
+    assert "Roll (deg)" in app_source
+    assert "Apply View" in app_source
+    assert "Reset View" in app_source
+    assert "Perspective" in app_source
+    assert "Front" in app_source
+    assert "Side" in app_source
+    assert "Top" in app_source
+    assert "plot_interactive_air_vectors(vector_records, \"si\", azimuth, elevation, roll)" in app_source
+    assert "st.plotly_chart" in app_source
+    assert "Use Current View" not in app_source
+    assert "components.declare_component" not in app_source
+    assert "plotly_camera" not in app_source
+    assert "analysis_latest_plotly_camera" not in app_source
+
+
+def test_app_camera_state_uses_pending_updates_for_widget_sync():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    set_camera_body = app_source.split("def set_analysis_camera", 1)[1].split(
+        "def queue_analysis_camera_update",
+        1,
+    )[0]
+    assert "_slider" not in set_camera_body
+    assert "_number" not in set_camera_body
+    assert "analysis_camera_pending" in app_source
+    assert "apply_pending_analysis_camera_update()" in app_source
+
+
+def test_app_pending_camera_update_syncs_canonical_and_widgets_before_render():
+    app = load_app_module()
+    app.st.session_state = {}
+    app.init_analysis_state()
+    app.queue_analysis_camera_update(15.0, 35.0, 5.0)
+    app.apply_pending_analysis_camera_update()
+    assert app.st.session_state["analysis_camera_azimuth"] == 15.0
+    assert app.st.session_state["analysis_camera_elevation"] == 35.0
+    assert app.st.session_state["analysis_camera_roll"] == 5.0
+    assert app.st.session_state["analysis_camera_azimuth_slider"] == 15.0
+    assert "analysis_camera_pending" not in app.st.session_state
+
+
+def test_app_has_no_custom_plotly_camera_component_dependency():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    requirements = (PROJECT_ROOT / "requirements.txt").read_text()
+    assert "streamlit.components" not in app_source
+    assert "declare_component" not in app_source
+    assert "app.plotly_camera" not in app_source
+    assert "plotly_camera" not in app_source
+    assert "streamlit-plotly-events" not in requirements
+    assert not (PROJECT_ROOT / "components" / "plotly_camera" / "index.html").exists()
+
+
+def test_app_manual_slider_changes_update_canonical_camera():
+    app = load_app_module()
+    app.st.session_state = {
+        "analysis_camera_azimuth_slider": 42.0,
+    }
+    app.sync_analysis_camera_from_widget("azimuth", "analysis_camera_azimuth_slider")
+    assert app.st.session_state["analysis_camera_azimuth"] == 42.0
+
+
+def test_app_uses_data_analysis_tab_instead_of_split_by_time_tab():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    tabs_line = [
+        line for line in app_source.splitlines() if "st.tabs" in line and "DAT" in line
+    ][0]
+    assert "Data Analysis" in tabs_line
+    assert "Merge CSV" in tabs_line
+    assert "Split by Time" not in tabs_line
+    assert "render_data_analysis_tool" in app_source
+
+
+def test_data_analysis_landing_contains_3d_and_vertical_methods():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    assert "Choose an analysis method" in app_source
+    assert "3D Vector Plot" in app_source
+    assert "Visualize 3D airflow direction and velocity magnitude in the room." in app_source
+    assert "Vertical Profile Plot" in app_source
+    assert "Plot vertical distributions of air velocity, temperature, and contaminant concentration." in app_source
+    assert "render_3d_vector_plot_tool" in app_source
+    assert "render_vertical_profile_tool" in app_source
+
+
+def test_vertical_profile_workflow_source_contains_required_controls():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    assert "Reset Vertical Profile Analysis" in app_source
+    assert "Do you want to add another position dataset?" in app_source
+    assert "Dataset Type" in app_source
+    assert "CFD input support is reserved for a future update." in app_source
+    assert "Air Velocity" in app_source
+    assert "Temperature" in app_source
+    assert "Contaminant Concentration" in app_source
+    assert "Normalized Profiles" in app_source
+    assert "Room Height H (ft)" in app_source
+    assert "Supply Air Velocity Us (m/s)" in app_source
+    assert "Velocity CSV upload" in app_source
+    assert "Temperature CSV upload" in app_source
+    assert "Contaminant CSV upload" in app_source
+    assert "Use Velocity CSV for Temperature" in app_source
+    assert "Use Velocity CSV for Contaminant Concentration" in app_source
+    assert "Height 1 Temperature Column" in app_source
+    assert "Height 1 Concentration Column" in app_source
+    assert "Download All Vertical Profile Files" in app_source
+
+
 def run_all_tests():
     tests = [
         test_standard_split,
@@ -1127,6 +1898,12 @@ def run_all_tests():
         test_hhmm_part_validation_accepts_and_normalizes_values,
         test_hhmm_part_validation_rejects_blank_invalid_and_out_of_range_values,
         test_hhmm_parts_reconstruct_to_position_range_times,
+        test_start_time_options_use_dataset_minute_range,
+        test_duration_options_and_validation,
+        test_duration_range_uses_half_open_interval,
+        test_duration_range_extending_beyond_dataset_is_rejected,
+        test_duration_range_empty_position_is_rejected,
+        test_duration_range_adjacent_positions_are_valid,
         test_integrated_dat_batch_output_contains_xlsx_and_csv_files,
         test_integrated_dat_positions_have_transformed_cleaned_data_only,
         test_dat_full_and_position_csv_content_rules,
@@ -1151,12 +1928,42 @@ def run_all_tests():
         test_dat_workflow_has_no_fixed_batch_limit,
         test_dat_workflow_source_limits_positions_to_six,
         test_dat_workflow_source_has_processing_status_messages,
-        test_dat_workflow_source_uses_separate_hh_mm_inputs,
+        test_dat_workflow_source_uses_start_time_and_duration_inputs,
         test_current_result_survives_session_state_rerun,
         test_process_next_file_preserves_completed_cases_before_reset,
         test_download_keys_are_unique_across_cases_and_positions,
         test_light_theme_config_exists,
         test_existing_merge_csv_still_works,
+        test_analysis_csv_validation_and_mean_vectors,
+        test_analysis_vector_records_coordinates_and_duplicates,
+        test_analysis_display_vectors_are_normalized_without_changing_true_values,
+        test_analysis_si_and_imperial_unit_conversions_are_correct,
+        test_analysis_si_and_imperial_display_scaling_is_equivalent,
+        test_analysis_position_coordinates_are_exact_and_not_swapped,
+        test_analysis_plot_source_uses_velocity_colormap_colorbar_and_no_position_labels,
+        test_analysis_camera_defaults_and_helpers,
+        test_analysis_plot_exports_eps_and_png,
+        test_analysis_interactive_plot_dependency_is_declared_or_available,
+        test_interactive_origin_markers_match_vector_start_points,
+        test_vertical_velocity_profile_averages_instantaneous_speed,
+        test_vertical_normalization_formulas_do_not_clip_values,
+        test_vertical_temperature_auto_and_manual_mapping,
+        test_vertical_contaminant_mapping_unit_and_summary,
+        test_vertical_build_records_for_three_variables_and_height_order,
+        test_vertical_profile_variables_can_use_independent_source_files,
+        test_vertical_profile_missing_selected_variable_remains_blank_in_unified_summary,
+        test_vertical_validation_rejects_missing_inputs_and_future_cfd,
+        test_vertical_plot_exports_and_zip,
+        test_vertical_plot_uses_separate_figure_title_and_shared_legend,
+        test_app_data_analysis_outputs_include_si_imperial_and_zip_files,
+        test_app_data_analysis_camera_controls_are_present,
+        test_app_camera_state_uses_pending_updates_for_widget_sync,
+        test_app_pending_camera_update_syncs_canonical_and_widgets_before_render,
+        test_app_has_no_custom_plotly_camera_component_dependency,
+        test_app_manual_slider_changes_update_canonical_camera,
+        test_app_uses_data_analysis_tab_instead_of_split_by_time_tab,
+        test_data_analysis_landing_contains_3d_and_vertical_methods,
+        test_vertical_profile_workflow_source_contains_required_controls,
     ]
     for test in tests:
         test()

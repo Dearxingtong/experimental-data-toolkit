@@ -88,6 +88,8 @@ class PositionRange:
     label: str
     start_time: time
     end_time: time
+    duration_minutes: int | None = None
+    end_is_exclusive: bool = False
 
 
 @dataclass
@@ -187,6 +189,73 @@ def build_time_range_from_parts(
         return None, None, errors
 
     return time(start_hour, start_minute), time(end_hour, end_minute), []
+
+
+def floor_to_minute(timestamp: pd.Timestamp) -> pd.Timestamp:
+    return timestamp.floor("min")
+
+
+def generate_minute_time_options(
+    first_timestamp: pd.Timestamp,
+    last_timestamp: pd.Timestamp,
+) -> list[time]:
+    """Generate one-minute start choices from the detected experiment range."""
+    start = floor_to_minute(first_timestamp)
+    end = floor_to_minute(last_timestamp)
+    if end < start:
+        return []
+
+    return [
+        timestamp.time().replace(second=0, microsecond=0)
+        for timestamp in pd.date_range(start, end, freq="min")
+    ]
+
+
+def format_hhmm(value: time) -> str:
+    return value.strftime("%H:%M")
+
+
+def format_duration_option(duration_minutes: int) -> str:
+    return f"{duration_minutes} min"
+
+
+def duration_options() -> list[int]:
+    return list(range(46))
+
+
+def validate_duration_minutes(label: str, duration_minutes: int) -> str | None:
+    if duration_minutes == 0:
+        return f"Please select a duration greater than 0 minutes for {label}."
+    if duration_minutes < 0 or duration_minutes > 45:
+        return f"{label} duration must be between 1 and 45 minutes."
+    return None
+
+
+def add_minutes_to_time(start_time: time, duration_minutes: int) -> time:
+    base = datetime.combine(datetime.today().date(), start_time)
+    return (base + timedelta(minutes=duration_minutes)).time().replace(second=0, microsecond=0)
+
+
+def build_position_range_from_duration(
+    label: str,
+    start_time: time,
+    duration_minutes: int,
+) -> tuple[PositionRange | None, str | None]:
+    duration_error = validate_duration_minutes(label, duration_minutes)
+    if duration_error:
+        return None, duration_error
+
+    calculated_end = add_minutes_to_time(start_time, duration_minutes)
+    return (
+        PositionRange(
+            label=label,
+            start_time=start_time,
+            end_time=calculated_end,
+            duration_minutes=duration_minutes,
+            end_is_exclusive=True,
+        ),
+        None,
+    )
 
 
 def find_timestamp_column(dataframe: pd.DataFrame) -> str | None:
@@ -323,7 +392,11 @@ def split_dataframe_by_boundaries(
 
 def range_to_boundaries(experiment_date, position_range: PositionRange) -> tuple[datetime, datetime]:
     start_boundary = datetime.combine(experiment_date, position_range.start_time)
-    end_boundary = datetime.combine(experiment_date, position_range.end_time) + timedelta(minutes=1)
+    end_boundary = datetime.combine(experiment_date, position_range.end_time)
+    if position_range.end_time < position_range.start_time:
+        end_boundary += timedelta(days=1)
+    if not position_range.end_is_exclusive:
+        end_boundary += timedelta(minutes=1)
     return start_boundary, end_boundary
 
 
@@ -392,10 +465,20 @@ def validate_position_ranges(
     boundaries: list[tuple[datetime, datetime]] = []
 
     for position_range in position_ranges:
-        if position_range.start_time > position_range.end_time:
+        if (
+            not position_range.end_is_exclusive
+            and position_range.start_time > position_range.end_time
+        ):
             return None, f"{position_range.label}: Start Time cannot be later than End Time."
 
         start_boundary, end_boundary = range_to_boundaries(experiment_date, position_range)
+        latest_allowed_end = floor_to_minute(primary.last_timestamp) + timedelta(minutes=1)
+        if position_range.end_is_exclusive and end_boundary > latest_allowed_end:
+            return (
+                None,
+                f"{position_range.label} extends beyond the available data range. "
+                "Please choose an earlier Start Time or shorter Duration.",
+            )
         if end_boundary <= experiment_start or start_boundary > experiment_end:
             return None, f"{position_range.label}: requested range is outside the experimental time range."
 
