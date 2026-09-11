@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Callable
@@ -90,6 +90,22 @@ class PositionRange:
     end_time: time
     duration_minutes: int | None = None
     end_is_exclusive: bool = False
+    start_datetime: datetime | None = None
+    end_datetime: datetime | None = None
+    position_number: int | None = None
+    split_number: int | None = None
+
+    @property
+    def output_date(self) -> date:
+        if self.start_datetime is not None:
+            return self.start_datetime.date()
+        return datetime.today().date()
+
+    @property
+    def start_sort_value(self) -> datetime:
+        if self.start_datetime is not None:
+            return self.start_datetime
+        return datetime.combine(datetime.today().date(), self.start_time)
 
 
 @dataclass
@@ -211,8 +227,32 @@ def generate_minute_time_options(
     ]
 
 
+def available_dates_from_timestamps(timestamps: pd.Series) -> list[date]:
+    return sorted(pd.Series(timestamps.dt.date).dropna().unique().tolist())
+
+
+def generate_minute_time_options_for_date(
+    timestamps: pd.Series,
+    selected_date: date,
+) -> list[time]:
+    selected = timestamps[timestamps.dt.date == selected_date]
+    if selected.empty:
+        return []
+    return generate_minute_time_options(selected.iloc[0], selected.iloc[-1])
+
+
 def format_hhmm(value: time) -> str:
     return value.strftime("%H:%M")
+
+
+def combine_date_and_time(selected_date: date, selected_time: time) -> datetime:
+    return datetime.combine(selected_date, selected_time)
+
+
+def format_calculated_end(start_datetime: datetime, end_datetime: datetime) -> str:
+    if start_datetime.date() == end_datetime.date():
+        return end_datetime.strftime("%H:%M")
+    return end_datetime.strftime("%Y-%m-%d %H:%M")
 
 
 def format_duration_option(duration_minutes: int) -> str:
@@ -240,12 +280,22 @@ def build_position_range_from_duration(
     label: str,
     start_time: time,
     duration_minutes: int,
+    selected_date: date | None = None,
+    position_number: int | None = None,
+    split_number: int | None = None,
 ) -> tuple[PositionRange | None, str | None]:
     duration_error = validate_duration_minutes(label, duration_minutes)
     if duration_error:
         return None, duration_error
 
-    calculated_end = add_minutes_to_time(start_time, duration_minutes)
+    start_datetime = None
+    end_datetime = None
+    if selected_date is not None:
+        start_datetime = combine_date_and_time(selected_date, start_time)
+        end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+        calculated_end = end_datetime.time().replace(second=0, microsecond=0)
+    else:
+        calculated_end = add_minutes_to_time(start_time, duration_minutes)
     return (
         PositionRange(
             label=label,
@@ -253,6 +303,10 @@ def build_position_range_from_duration(
             end_time=calculated_end,
             duration_minutes=duration_minutes,
             end_is_exclusive=True,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            position_number=position_number,
+            split_number=split_number,
         ),
         None,
     )
@@ -313,13 +367,6 @@ def analyze_workbook_dataframes(
         if not parsed_timestamps.is_monotonic_increasing:
             errors.append(
                 f"{filename} sheet {sheet_name} has TIMESTAMP values out of chronological order."
-            )
-            continue
-
-        dates = pd.Series(parsed_timestamps.dt.date).dropna().unique()
-        if len(dates) != 1:
-            errors.append(
-                "This version of Split by Time supports single-day experimental files only."
             )
             continue
 
@@ -391,6 +438,8 @@ def split_dataframe_by_boundaries(
 
 
 def range_to_boundaries(experiment_date, position_range: PositionRange) -> tuple[datetime, datetime]:
+    if position_range.start_datetime is not None and position_range.end_datetime is not None:
+        return position_range.start_datetime, position_range.end_datetime
     start_boundary = datetime.combine(experiment_date, position_range.start_time)
     end_boundary = datetime.combine(experiment_date, position_range.end_time)
     if position_range.end_time < position_range.start_time:
@@ -445,10 +494,21 @@ def check_position_range_qc(
     sheet_name: str,
     split_dataframes: tuple[pd.DataFrame, ...],
 ) -> bool:
-    assigned_indices: list[int] = []
+    # Overlapping split intervals are allowed for repeated measurements. Each
+    # output must still contain each source observation at most once.
     for frame in split_dataframes:
-        assigned_indices.extend(frame.index.tolist())
-    return len(assigned_indices) == len(set(assigned_indices))
+        if len(frame.index.tolist()) != len(set(frame.index.tolist())):
+            return False
+    return True
+
+
+def position_number_from_range(position_range: PositionRange) -> int:
+    if position_range.position_number is not None:
+        return position_range.position_number
+    digits = "".join(character for character in position_range.label if character.isdigit())
+    if digits:
+        return int(digits)
+    raise ValueError(f"{position_range.label} does not include a physical position number.")
 
 
 def validate_position_ranges(
@@ -459,10 +519,10 @@ def validate_position_ranges(
     if primary is None:
         return None, f"{analysis.filename} cannot be split because no TIMESTAMP data was found."
 
-    experiment_date = primary.first_timestamp.date()
     experiment_start = primary.first_timestamp.to_pydatetime()
     experiment_end = primary.last_timestamp.to_pydatetime()
     boundaries: list[tuple[datetime, datetime]] = []
+    duplicate_keys: set[tuple[int, datetime]] = set()
 
     for position_range in position_ranges:
         if (
@@ -471,14 +531,14 @@ def validate_position_ranges(
         ):
             return None, f"{position_range.label}: Start Time cannot be later than End Time."
 
-        start_boundary, end_boundary = range_to_boundaries(experiment_date, position_range)
-        latest_allowed_end = floor_to_minute(primary.last_timestamp) + timedelta(minutes=1)
-        if position_range.end_is_exclusive and end_boundary > latest_allowed_end:
-            return (
-                None,
-                f"{position_range.label} extends beyond the available data range. "
-                "Please choose an earlier Start Time or shorter Duration.",
-            )
+        start_boundary, end_boundary = range_to_boundaries(primary.first_timestamp.date(), position_range)
+        duplicate_key = (position_number_from_range(position_range), start_boundary)
+        if duplicate_key in duplicate_keys:
+            return None, f"{position_range.label}: duplicate Position and Start Datetime."
+        duplicate_keys.add(duplicate_key)
+
+        if end_boundary <= start_boundary:
+            return None, f"{position_range.label}: calculated end must be later than start."
         if end_boundary <= experiment_start or start_boundary > experiment_end:
             return None, f"{position_range.label}: requested range is outside the experimental time range."
 
@@ -492,15 +552,6 @@ def validate_position_ranges(
             return None, f"{position_range.label}: requested range contains no observations."
 
         boundaries.append((start_boundary, end_boundary))
-
-    for left_index, left in enumerate(boundaries):
-        for right_index, right in enumerate(boundaries[left_index + 1 :], start=left_index + 1):
-            if max(left[0], right[0]) < min(left[1], right[1]):
-                return (
-                    None,
-                    f"{position_ranges[left_index].label} and {position_ranges[right_index].label} "
-                    "contain overlapping time ranges.",
-                )
 
     return boundaries, None
 
@@ -570,12 +621,13 @@ def split_workbook_by_position_ranges(
 
     output_files = []
     final_output_workbooks = []
-    for position_number, (output_filename, output_workbook) in enumerate(
-        zip(output_filenames, output_workbooks),
-        start=1,
+    for position_range, output_filename, output_workbook in zip(
+        position_ranges,
+        output_filenames,
+        output_workbooks,
     ):
         if workbook_transformer is not None:
-            output_workbook = workbook_transformer(position_number, output_workbook)
+            output_workbook = workbook_transformer(position_number_from_range(position_range), output_workbook)
         final_output_workbooks.append(output_workbook)
         output_files.append((output_filename, write_xlsx_workbook(output_workbook)))
 

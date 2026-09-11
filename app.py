@@ -41,14 +41,17 @@ from time_splitter import (
     PositionRange,
     WorkbookAnalysis,
     analyze_workbook_dataframes,
+    available_dates_from_timestamps,
     build_zip as build_split_zip,
     analyze_xlsx_upload,
     build_position_range_from_duration,
     duration_options,
+    format_calculated_end,
     format_duration_option,
     format_hhmm,
-    generate_minute_time_options,
+    generate_minute_time_options_for_date,
     parse_hhmm_time,
+    position_number_from_range,
     split_workbook_by_position_ranges,
     split_workbook,
 )
@@ -73,8 +76,9 @@ from vertical_profile_processor import (
 
 CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 PREVIEW_ROWS = 20
-MIN_DAT_POSITIONS = 2
-MAX_DAT_POSITIONS = 6
+MIN_DAT_SPLITS = 1
+MAX_DAT_PHYSICAL_POSITIONS = 6
+DEFAULT_DAT_SPLITS = 3
 VERTICAL_PROFILE_TEMPERATURE_LABELS = (
     "Height 1 Temperature Column",
     "Height 2 Temperature Column",
@@ -343,18 +347,51 @@ def transform_dat_position_workbook(
     return transformed_workbook
 
 
-def dat_velocity_transform_notes(position_count: int) -> tuple[str, ...]:
+def dat_velocity_transform_notes(position_numbers: list[int]) -> tuple[str, ...]:
     notes: list[str] = []
-    if position_count >= 1:
-        first_group_end = min(3, position_count)
-        notes.append(
-            f"P01-P{first_group_end:02d}: {velocity_transform_description(1)}"
-        )
-    if position_count >= 4:
-        notes.append(
-            f"P04-P{position_count:02d}: {velocity_transform_description(4)}"
-        )
+    if any(position_number <= 3 for position_number in position_numbers):
+        notes.append(f"P01-P03: {velocity_transform_description(1)}")
+    if any(position_number >= 4 for position_number in position_numbers):
+        notes.append(f"P04-P06: {velocity_transform_description(4)}")
     return tuple(notes)
+
+
+def split_range_output_date(position_range: PositionRange, fallback_date: date) -> date:
+    if position_range.start_datetime is not None:
+        return position_range.start_datetime.date()
+    return fallback_date
+
+
+def split_output_requires_start_time(
+    position_ranges: list[PositionRange],
+    position_range: PositionRange,
+    fallback_date: date,
+) -> bool:
+    current_position = position_number_from_range(position_range)
+    current_date = split_range_output_date(position_range, fallback_date)
+    matches = [
+        candidate
+        for candidate in position_ranges
+        if position_number_from_range(candidate) == current_position
+        and split_range_output_date(candidate, fallback_date) == current_date
+    ]
+    return len(matches) > 1
+
+
+def split_position_workbook_filename(
+    case_number: str,
+    fallback_date: date,
+    position_ranges: list[PositionRange],
+    position_range: PositionRange,
+) -> str:
+    start_datetime = position_range.start_datetime
+    return position_workbook_filename(
+        case_number,
+        position_number_from_range(position_range),
+        split_range_output_date(position_range, fallback_date),
+        start_datetime=start_datetime,
+        include_start_time=split_output_requires_start_time(position_ranges, position_range, fallback_date),
+    )
 
 
 def build_completed_dat_case(
@@ -394,8 +431,8 @@ def build_completed_dat_case(
             all_filename,
         )
         position_filenames = [
-            position_workbook_filename(case_number, index + 1, case_date)
-            for index in range(len(position_ranges))
+            split_position_workbook_filename(case_number, case_date, position_ranges, position_range)
+            for position_range in position_ranges
         ]
         result, split_error = split_workbook_by_position_ranges(
             analysis,
@@ -451,9 +488,13 @@ def build_completed_dat_case(
             position_ranges=[
                 (
                     position_range.label,
-                    position_range.start_time.strftime("%H:%M"),
+                    position_range.start_datetime.strftime("%Y-%m-%d %H:%M")
+                    if position_range.start_datetime
+                    else position_range.start_time.strftime("%H:%M"),
                     position_range.duration_minutes,
-                    position_range.end_time.strftime("%H:%M"),
+                    position_range.end_datetime.strftime("%Y-%m-%d %H:%M")
+                    if position_range.end_datetime
+                    else position_range.end_time.strftime("%H:%M"),
                 )
                 for position_range in position_ranges
             ],
@@ -463,7 +504,7 @@ def build_completed_dat_case(
             position_summaries=position_summaries,
             qc_results=qc_results,
             velocity_transform_notes=(
-                dat_velocity_transform_notes(len(position_ranges))
+                dat_velocity_transform_notes([position_number_from_range(position_range) for position_range in position_ranges])
                 if split_enabled
                 else tuple()
             ),
@@ -569,7 +610,7 @@ def render_completed_case_summary(completed_case: CompletedDatCase) -> None:
     if completed_case.split_enabled:
         if all(qc.no_duplicate_assignments for qc in completed_case.qc_results):
             st.write("✓ All Position ranges processed")
-            st.write("✓ No overlapping observations")
+            st.write("✓ Each split output contains unique observations")
         else:
             st.error("Position QC failed.")
         for note in completed_case.velocity_transform_notes:
@@ -588,13 +629,13 @@ def render_completed_files_section() -> None:
         for completed_case in completed_cases:
             outputs = "Full"
             if completed_case.split_enabled:
-                outputs = f"Full + P01-P{completed_case.position_count:02d}"
+                outputs = f"Full + {completed_case.position_count} split outputs"
             summary_rows.append(
                 {
                     "Case": f"C{completed_case.case_number}",
                     "Date": format_case_date(completed_case.case_date),
                     "Split": (
-                        f"{completed_case.position_count} Positions"
+                        f"{completed_case.position_count} Splits"
                         if completed_case.split_enabled
                         else "No"
                     ),
@@ -634,55 +675,78 @@ def render_batch_complete() -> None:
 
 
 def collect_position_ranges(
-    position_count: int,
+    split_count: int,
     key_prefix: str,
-    first_timestamp: pd.Timestamp,
-    last_timestamp: pd.Timestamp,
+    timestamps: pd.Series,
 ) -> tuple[list[PositionRange], list[str]]:
     position_ranges: list[PositionRange] = []
     errors: list[str] = []
-    st.markdown("### Position Time Ranges")
-    start_options = generate_minute_time_options(first_timestamp, last_timestamp)
+    st.markdown("### Split Time Ranges")
+    date_options = available_dates_from_timestamps(timestamps)
     duration_values = duration_options()
-    if not start_options:
-        return [], ["No Start Time options could be generated from the detected data range."]
+    if not date_options:
+        return [], ["No Date options could be generated from the detected data range."]
 
-    header_cols = st.columns([1.1, 1.6, 1.4, 1.2])
-    header_cols[0].markdown("**Position**")
-    header_cols[1].markdown("**Start Time**")
-    header_cols[2].markdown("**Duration (min)**")
-    header_cols[3].markdown("**Calculated End**")
+    header_cols = st.columns([0.7, 1.1, 1.4, 1.4, 1.2, 1.4])
+    header_cols[0].markdown("**Split**")
+    header_cols[1].markdown("**Position**")
+    header_cols[2].markdown("**Date**")
+    header_cols[3].markdown("**Start Time**")
+    header_cols[4].markdown("**Duration (min)**")
+    header_cols[5].markdown("**Calculated End**")
 
-    for position_number in range(1, position_count + 1):
-        label = f"P{position_number:02d}"
-        row_cols = st.columns([1.1, 1.6, 1.4, 1.2])
-        row_cols[0].write(label)
-        selected_start = row_cols[1].selectbox(
-            f"{label} Start Time",
+    for split_number in range(1, split_count + 1):
+        split_label = f"Split {split_number}"
+        row_cols = st.columns([0.7, 1.1, 1.4, 1.4, 1.2, 1.4])
+        row_cols[0].write(split_number)
+        selected_position = row_cols[1].selectbox(
+            f"{split_label} Position",
+            options=list(range(1, MAX_DAT_PHYSICAL_POSITIONS + 1)),
+            format_func=lambda value: f"P{value}",
+            label_visibility="collapsed",
+            key=f"{key_prefix}_position_{split_number}",
+        )
+        selected_date = row_cols[2].selectbox(
+            f"{split_label} Date",
+            options=date_options,
+            label_visibility="collapsed",
+            key=f"{key_prefix}_date_{split_number}",
+        )
+        start_options = generate_minute_time_options_for_date(timestamps, selected_date)
+        if not start_options:
+            errors.append(f"{split_label}: selected date is not represented in the uploaded data.")
+            row_cols[3].write("No times")
+            continue
+        selected_start = row_cols[3].selectbox(
+            f"{split_label} Start Time",
             options=start_options,
             format_func=format_hhmm,
             label_visibility="collapsed",
-            key=f"{key_prefix}_start_time_{position_number}",
+            key=f"{key_prefix}_start_time_{split_number}",
         )
-        selected_duration = row_cols[2].selectbox(
-            f"{label} Duration (min)",
+        selected_duration = row_cols[4].selectbox(
+            f"{split_label} Duration (min)",
             options=duration_values,
             format_func=format_duration_option,
             index=0,
             label_visibility="collapsed",
-            key=f"{key_prefix}_duration_{position_number}",
+            key=f"{key_prefix}_duration_{split_number}",
         )
+        label = f"P{selected_position:02d}"
         position_range, range_error = build_position_range_from_duration(
             label,
             selected_start,
             selected_duration,
+            selected_date=selected_date,
+            position_number=selected_position,
+            split_number=split_number,
         )
         calculated_end = (
-            format_hhmm(position_range.end_time)
+            format_calculated_end(position_range.start_datetime, position_range.end_datetime)
             if position_range is not None
             else "Select duration"
         )
-        row_cols[3].write(calculated_end)
+        row_cols[5].write(calculated_end)
         if range_error:
             errors.append(range_error)
         elif position_range is not None:
@@ -695,7 +759,7 @@ def validate_case_inputs(
     case_no_input: str,
     case_date_input,
     split_enabled: bool,
-    position_count: int,
+    split_count: int,
     position_ranges: list[PositionRange],
     position_errors: list[str],
 ) -> tuple[str | None, list[str]]:
@@ -708,14 +772,12 @@ def validate_case_inputs(
         errors.append("Please select a Case Date.")
 
     if split_enabled:
-        if position_count < MIN_DAT_POSITIONS or position_count > MAX_DAT_POSITIONS:
-            errors.append(
-                f"Split Position count must be between {MIN_DAT_POSITIONS} and {MAX_DAT_POSITIONS}."
-            )
+        if split_count < MIN_DAT_SPLITS:
+            errors.append(f"Number of Splits must be at least {MIN_DAT_SPLITS}.")
         if position_errors:
             errors.extend(position_errors)
-        if len(position_ranges) != position_count:
-            errors.append("Please select Start Time and Duration for all Positions.")
+        if len(position_ranges) != split_count:
+            errors.append("Please select Position, Date, Start Time, and Duration for all Splits.")
 
     if case_number and case_date_input is not None and case_already_used(case_number, case_date_input):
         errors.append("This Case No and Case Date combination has already been used in the current batch.")
@@ -777,17 +839,12 @@ def render_dat_to_xlsx_tool() -> None:
         )
 
         st.markdown("### Case Information")
-        case_col, date_col, split_col = st.columns([1, 1, 1])
+        case_col, split_col, date_col = st.columns([1, 1, 1])
         case_no_input = case_col.text_input(
             "Case No",
             value="",
             placeholder="3",
             key=f"dat_case_no_{st.session_state['dat_uploader_version']}",
-        )
-        case_date_input = date_col.date_input(
-            "Case Date",
-            value=detected_case_date(processed_file),
-            key=f"dat_case_date_{st.session_state['dat_uploader_version']}",
         )
         split_choice = split_col.selectbox(
             "Split this file?",
@@ -796,27 +853,38 @@ def render_dat_to_xlsx_tool() -> None:
             placeholder="Choose",
             key=f"dat_split_choice_{st.session_state['dat_uploader_version']}",
         )
+        split_enabled = split_choice == "Yes"
+        case_date_input = date_col.date_input(
+            "Case Date",
+            value=detected_case_date(processed_file),
+            disabled=split_enabled,
+            help=(
+                "Used for the Full Dataset output. Split outputs use each row's selected Date."
+                if split_enabled
+                else None
+            ),
+            key=f"dat_case_date_{st.session_state['dat_uploader_version']}",
+        )
+        if split_enabled:
+            st.caption("Split output filenames use each split row's selected Date. The global Case Date remains for the Full Dataset.")
 
         position_ranges: list[PositionRange] = []
         position_errors: list[str] = []
-        split_enabled = split_choice == "Yes"
         if split_enabled:
-            position_count = st.number_input(
-                "Number of Positions",
-                min_value=MIN_DAT_POSITIONS,
-                max_value=MAX_DAT_POSITIONS,
-                value=3,
+            split_count = st.number_input(
+                "Number of Splits",
+                min_value=MIN_DAT_SPLITS,
+                value=DEFAULT_DAT_SPLITS,
                 step=1,
-                key=f"dat_position_count_{st.session_state['dat_uploader_version']}",
+                key=f"dat_split_count_{st.session_state['dat_uploader_version']}",
             )
             position_ranges, position_errors = collect_position_ranges(
-                int(position_count),
+                int(split_count),
                 f"dat_position_{st.session_state['dat_uploader_version']}",
-                timestamps.iloc[0],
-                timestamps.iloc[-1],
+                timestamps,
             )
         else:
-            position_count = 0
+            split_count = 0
 
         if st.button("Process File", type="primary"):
             if split_choice is None:
@@ -827,7 +895,7 @@ def render_dat_to_xlsx_tool() -> None:
                     case_no_input,
                     case_date_input,
                     split_enabled,
-                    int(position_count),
+                    int(split_count),
                     position_ranges,
                     position_errors,
                 )

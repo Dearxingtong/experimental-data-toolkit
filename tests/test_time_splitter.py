@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -49,6 +49,24 @@ def duration_range(label: str, start_time: time, duration_minutes: int) -> split
         label,
         start_time,
         duration_minutes,
+    )
+    assert error is None
+    return position_range
+
+
+def dated_duration_range(
+    label: str,
+    selected_date: date,
+    start_time: time,
+    duration_minutes: int,
+    position_number: int,
+) -> splitter.PositionRange:
+    position_range, error = splitter.build_position_range_from_duration(
+        label,
+        start_time,
+        duration_minutes,
+        selected_date=selected_date,
+        position_number=position_number,
     )
     assert error is None
     return position_range
@@ -598,11 +616,9 @@ def test_duration_range_extending_beyond_dataset_is_rejected():
         [duration_range("P03", time(13, 0), 10)],
         ["C03_P03_26.08.26.xlsx"],
     )
-    assert result is None
-    assert error == (
-        "P03 extends beyond the available data range. "
-        "Please choose an earlier Start Time or shorter Duration."
-    )
+    assert error is None
+    assert result is not None
+    assert result.position_summaries[0].rows == 1
 
 
 def test_duration_range_empty_position_is_rejected():
@@ -635,6 +651,164 @@ def test_duration_range_adjacent_positions_are_valid():
     assert error is None
     assert [summary.rows for summary in result.position_summaries] == [5, 5]
     assert result.qc_results[0].no_duplicate_assignments
+
+
+def test_multiday_workbook_analysis_and_date_time_options():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": [
+                "2026-08-28 14:36:01",
+                "2026-08-28 14:37:00",
+                "2026-09-10 12:39:00",
+                "2026-09-10 12:40:09",
+            ]
+        }
+    )
+    analysis = analyze_dataframe(dataframe, "multi_day.xlsx")
+    primary = analysis.primary_sheet
+    assert primary is not None
+    assert splitter.available_dates_from_timestamps(primary.parsed_timestamps) == [
+        pd.Timestamp("2026-08-28").date(),
+        pd.Timestamp("2026-09-10").date(),
+    ]
+    september_options = splitter.generate_minute_time_options_for_date(
+        primary.parsed_timestamps,
+        pd.Timestamp("2026-09-10").date(),
+    )
+    assert september_options[0] == time(12, 39)
+    assert september_options[-1] == time(12, 40)
+
+
+def test_date_start_time_combines_to_full_datetime_and_cross_midnight_end_format():
+    position_range = dated_duration_range(
+        "P01",
+        pd.Timestamp("2026-09-10").date(),
+        time(23, 59),
+        3,
+        1,
+    )
+    assert position_range.start_datetime == pd.Timestamp("2026-09-10 23:59:00").to_pydatetime()
+    assert position_range.end_datetime == pd.Timestamp("2026-09-11 00:02:00").to_pydatetime()
+    assert splitter.format_calculated_end(position_range.start_datetime, position_range.end_datetime) == "2026-09-11 00:02"
+
+
+def test_multiday_split_uses_full_datetime_half_open_slicing():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": [
+                "2026-09-09 12:09:00",
+                "2026-09-10 12:09:00",
+                "2026-09-10 12:09:59.999",
+                "2026-09-10 12:10:00",
+            ],
+            "U1": [0, 1, 2, 3],
+        }
+    )
+    analysis = analyze_dataframe(dataframe, "multi_day.xlsx")
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 9), 1, 1)],
+        ["C03_P01_26.09.10_1209.xlsx"],
+    )
+    assert error is None
+    workbook = pd.read_excel(BytesIO(result.output_files[0][1]), sheet_name=None, engine="openpyxl")
+    assert list(workbook["Cleaned_Data"]["U1"]) == [1, 2]
+
+
+def test_cross_midnight_split_uses_full_datetimes():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": [
+                "2026-09-10 23:59:00",
+                "2026-09-11 00:00:00",
+                "2026-09-11 00:01:59.999",
+                "2026-09-11 00:02:00",
+            ],
+            "U1": [1, 2, 3, 4],
+        }
+    )
+    analysis = analyze_dataframe(dataframe, "cross_midnight.xlsx")
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(23, 59), 3, 1)],
+        ["C03_P01_26.09.10_2359.xlsx"],
+    )
+    assert error is None
+    workbook = pd.read_excel(BytesIO(result.output_files[0][1]), sheet_name=None, engine="openpyxl")
+    assert list(workbook["Cleaned_Data"]["U1"]) == [1, 2, 3]
+
+
+def test_repeated_position_duplicate_rules_use_position_and_full_start_datetime():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": pd.date_range("2026-09-10 12:09:00", periods=5, freq="1min"),
+        }
+    )
+    analysis = analyze_dataframe(dataframe, "repeat_positions.xlsx")
+    valid_ranges = [
+        dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 9), 1, 1),
+        dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 10), 1, 1),
+        dated_duration_range("P03", pd.Timestamp("2026-09-10").date(), time(12, 9), 1, 3),
+    ]
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        valid_ranges,
+        ["a.xlsx", "b.xlsx", "c.xlsx"],
+    )
+    assert error is None
+    assert result is not None
+
+    duplicate_ranges = [
+        dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 9), 1, 1),
+        dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 9), 1, 1),
+    ]
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        duplicate_ranges,
+        ["a.xlsx", "b.xlsx"],
+    )
+    assert result is None
+    assert error == "P01: duplicate Position and Start Datetime."
+
+
+def test_same_position_same_time_different_date_is_valid():
+    dataframe = pd.DataFrame(
+        {
+            "TIMESTAMP": [
+                "2026-09-09 12:09:00",
+                "2026-09-10 12:09:00",
+            ],
+        }
+    )
+    analysis = analyze_dataframe(dataframe, "repeat_dates.xlsx")
+    result, error = splitter.split_workbook_by_position_ranges(
+        analysis,
+        [
+            dated_duration_range("P01", pd.Timestamp("2026-09-09").date(), time(12, 9), 1, 1),
+            dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 9), 1, 1),
+        ],
+        ["a.xlsx", "b.xlsx"],
+    )
+    assert error is None
+    assert result is not None
+
+
+def test_repeated_position_output_filenames_include_start_time_when_needed():
+    app = load_app_module()
+    ranges = [
+        dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(11, 59), 3, 1),
+        dated_duration_range("P01", pd.Timestamp("2026-09-10").date(), time(12, 9), 3, 1),
+        dated_duration_range("P03", pd.Timestamp("2026-09-10").date(), time(12, 4), 3, 3),
+    ]
+    filenames = [
+        app.split_position_workbook_filename("01", pd.Timestamp("2026-08-26").date(), ranges, position_range)
+        for position_range in ranges
+    ]
+    assert filenames == [
+        "C01_P01_26.09.10_1159.xlsx",
+        "C01_P01_26.09.10_1209.xlsx",
+        "C01_P03_26.09.10.xlsx",
+    ]
 
 
 def test_integrated_dat_batch_output_contains_xlsx_and_csv_files():
@@ -912,19 +1086,28 @@ def test_split_yes_with_2_3_5_and_6_positions():
         assert result.output_files[0][0] == "C03_P01_26.08.26.xlsx"
 
 
-def test_dat_case_validation_rejects_position_count_above_six():
+def test_dat_case_validation_allows_split_count_above_six():
     app = load_app_module()
     app.st.session_state = {"dat_completed_cases": []}
+    ranges = [
+        splitter.PositionRange(
+            "P01",
+            time(13, index),
+            time(13, index),
+            position_number=1,
+        )
+        for index in range(7)
+    ]
     case_number, errors = app.validate_case_inputs(
         "3",
         pd.Timestamp("2026-08-26").date(),
         True,
         7,
-        [splitter.PositionRange(f"P{index + 1:02d}", time(13, index), time(13, index)) for index in range(7)],
+        ranges,
         [],
     )
     assert case_number == "03"
-    assert "Split Position count must be between 2 and 6." in errors
+    assert errors == []
 
 
 def test_position_range_start_inclusive_and_end_minute_inclusive():
@@ -972,7 +1155,7 @@ def test_position_gaps_are_allowed_without_lost_row_qc_failure():
     assert result.qc_results[0].no_duplicate_assignments
 
 
-def test_position_overlaps_are_rejected():
+def test_position_overlaps_are_allowed():
     dataframe = pd.DataFrame(
         {"TIMESTAMP": pd.date_range("2026-08-26 13:00:00", periods=121, freq="1min")}
     )
@@ -985,8 +1168,10 @@ def test_position_overlaps_are_rejected():
         ],
         ["C03_P01_26.08.26.xlsx", "C03_P02_26.08.26.xlsx"],
     )
-    assert result is None
-    assert error == "P01 and P02 contain overlapping time ranges."
+    assert error is None
+    assert result is not None
+    assert [summary.rows for summary in result.position_summaries] == [61, 71]
+    assert result.qc_results[0].no_duplicate_assignments
 
 
 def test_position_start_later_than_end_is_rejected():
@@ -1062,7 +1247,7 @@ def test_case_validation_reports_empty_case_and_missing_date():
     assert "Please select a Case Date." in errors
 
 
-def test_case_validation_reports_incomplete_positions():
+def test_case_validation_reports_incomplete_splits():
     app = load_app_module()
     app.st.session_state = {"dat_completed_cases": []}
     case_number, errors = app.validate_case_inputs(
@@ -1074,7 +1259,7 @@ def test_case_validation_reports_incomplete_positions():
         ["Please select a duration greater than 0 minutes for P02."],
     )
     assert case_number == "03"
-    assert "Please select Start Time and Duration for all Positions." in errors
+    assert "Please select Position, Date, Start Time, and Duration for all Splits." in errors
     assert "Please select a duration greater than 0 minutes for P02." in errors
 
 
@@ -1105,10 +1290,13 @@ def test_dat_workflow_has_no_fixed_batch_limit():
     assert "Files processed in current batch:" in app_source
 
 
-def test_dat_workflow_source_limits_positions_to_six():
+def test_dat_workflow_source_uses_splits_and_limits_physical_positions_to_six():
     app_source = (PROJECT_ROOT / "app.py").read_text()
-    assert "MAX_DAT_POSITIONS = 6" in app_source
-    assert "max_value=MAX_DAT_POSITIONS" in app_source
+    assert "MAX_DAT_PHYSICAL_POSITIONS = 6" in app_source
+    assert "Number of Splits" in app_source
+    assert "Number of Positions" not in app_source
+    assert "options=list(range(1, MAX_DAT_PHYSICAL_POSITIONS + 1))" in app_source
+    assert "max_value=MAX_DAT_PHYSICAL_POSITIONS" not in app_source
     assert "max_value=10" not in app_source
 
 
@@ -1131,9 +1319,11 @@ def test_dat_workflow_source_has_processing_status_messages():
 def test_dat_workflow_source_uses_start_time_and_duration_inputs():
     app_source = (PROJECT_ROOT / "app.py").read_text()
     assert "Start Time" in app_source
+    assert "Date" in app_source
+    assert "Split Time Ranges" in app_source
     assert "Duration (min)" in app_source
     assert "Calculated End" in app_source
-    assert "generate_minute_time_options" in app_source
+    assert "generate_minute_time_options_for_date" in app_source
     assert "duration_options" in app_source
     assert "build_position_range_from_duration" in app_source
     assert "Start HH" not in app_source
@@ -1904,6 +2094,13 @@ def run_all_tests():
         test_duration_range_extending_beyond_dataset_is_rejected,
         test_duration_range_empty_position_is_rejected,
         test_duration_range_adjacent_positions_are_valid,
+        test_multiday_workbook_analysis_and_date_time_options,
+        test_date_start_time_combines_to_full_datetime_and_cross_midnight_end_format,
+        test_multiday_split_uses_full_datetime_half_open_slicing,
+        test_cross_midnight_split_uses_full_datetimes,
+        test_repeated_position_duplicate_rules_use_position_and_full_start_datetime,
+        test_same_position_same_time_different_date_is_valid,
+        test_repeated_position_output_filenames_include_start_time_when_needed,
         test_integrated_dat_batch_output_contains_xlsx_and_csv_files,
         test_integrated_dat_positions_have_transformed_cleaned_data_only,
         test_dat_full_and_position_csv_content_rules,
@@ -1913,20 +2110,20 @@ def run_all_tests():
         test_case_and_filename_formatting,
         test_no_split_generates_only_all_workbook_with_complete_data,
         test_split_yes_with_2_3_5_and_6_positions,
-        test_dat_case_validation_rejects_position_count_above_six,
+        test_dat_case_validation_allows_split_count_above_six,
         test_position_range_start_inclusive_and_end_minute_inclusive,
         test_position_gaps_are_allowed_without_lost_row_qc_failure,
-        test_position_overlaps_are_rejected,
+        test_position_overlaps_are_allowed,
         test_position_start_later_than_end_is_rejected,
         test_position_with_zero_observations_is_rejected,
         test_duplicate_case_date_detection_helper,
         test_case_validation_accepts_entered_case_number,
         test_case_validation_reports_empty_case_and_missing_date,
-        test_case_validation_reports_incomplete_positions,
+        test_case_validation_reports_incomplete_splits,
         test_dat_workflow_source_has_no_empty_edt_card_placeholder,
         test_dat_workflow_source_removes_technical_details_and_preview,
         test_dat_workflow_has_no_fixed_batch_limit,
-        test_dat_workflow_source_limits_positions_to_six,
+        test_dat_workflow_source_uses_splits_and_limits_physical_positions_to_six,
         test_dat_workflow_source_has_processing_status_messages,
         test_dat_workflow_source_uses_start_time_and_duration_inputs,
         test_current_result_survives_session_state_rerun,

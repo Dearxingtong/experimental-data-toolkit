@@ -6,7 +6,7 @@ Experimental Data Toolkit is a lightweight Streamlit web application for routine
 
 The MVP includes three tools:
 
-- **DAT → XLSX**: Process one experimental `.dat` file at a time, assign Case No and Case Date, optionally split into 2 to 6 user-defined Positions, and download XLSX and CSV outputs.
+- **DAT → XLSX**: Process one experimental `.dat` file at a time, assign Case No, optionally split into user-defined measurement intervals for physical Positions P1-P6, and download XLSX and CSV outputs.
 - **Merge CSV Files**: Upload two or more `.csv` files, preview each file, merge them vertically by rows, and download the merged result as CSV or XLSX.
 - **Data Analysis**: Choose between a 3D airflow vector plot workflow and a vertical profile plotting workflow for experimental room data.
 
@@ -39,17 +39,18 @@ Then open the local Streamlit URL shown in your terminal.
 - Use the second DAT row as source column names and rows 5 onward as observations.
 - Keep and rename the required sensor columns to `TIMESTAMP`, `U1`, `V1`, `W1`, `Temp1`, `U2`, `V2`, `W2`, `Temp2`, `U3`, `V3`, `W3`, and `Temp3`.
 - Remove unneeded columns such as `RECORD`, `A_SensorStatus`, `B_SensorStatus`, and `C_SensorStatus` from the cleaned output.
-- Enter required Case No and Case Date for output naming.
+- Enter required Case No. Case Date is retained for the Full Dataset output.
 - Generate the complete Full Dataset for every processed case.
 - Choose Split Yes or No for each file.
-- If Split is Yes, choose 2 through 6 Positions, select a Start Time from the detected experiment range, and select a Duration from 0 to 45 minutes.
+- If Split is Yes, choose the Number of Splits. Each split row independently selects one physical Position from P1-P6, a Date represented in the file, a Start Time for that date, and a Duration from 0 to 45 minutes.
 - Duration `0 min` is treated as unconfigured and must be changed to a value greater than zero before processing.
-- Position intervals use half-open slicing: `start <= TIMESTAMP < start + duration`.
-- Position gaps are allowed; overlaps are rejected.
+- Split intervals use full datetime half-open slicing: `start_datetime <= TIMESTAMP < start_datetime + duration`.
+- Repeated measurements of the same physical Position are allowed. Only duplicate `Position + Start Datetime` combinations are rejected.
+- Split output filenames use the selected split Date. If the same Position appears more than once on the same date, the split start time is appended to prevent overwriting.
 - Position workbooks add derived velocity columns in `Cleaned_Data` only: P01-P03 use `Vx = W`, `Vy = -U`, `Vz = -V`; P04-P06 use `Vx = -W`, `Vy = U`, `Vz = -V`.
 - The Full Dataset XLSX remains untransformed, and every XLSX contains `Cleaned_Data` and `Raw_Data`.
 - CSV outputs contain `Cleaned_Data` only; no Raw CSV files are created.
-- Output filenames use the Case No and Case Date, such as `C03_All_26.08.26.xlsx`, `C03_All_26.08.26.csv`, `C03_P01_26.08.26.xlsx`, and `C03_P01_26.08.26.csv`.
+- Output filenames use the Case No and output date, such as `C03_All_26.08.26.xlsx`, `C03_All_26.08.26.csv`, `C03_P01_26.09.10.xlsx`, or `C03_P01_26.09.10_1209.xlsx`.
 - Download the current case outputs immediately, process the next file, or finish the batch.
 - Download all generated XLSX and CSV outputs for the current case or final batch as one ZIP.
 

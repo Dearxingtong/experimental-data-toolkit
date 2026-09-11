@@ -617,7 +617,7 @@ def plot_3d_air_vectors(
         magnitudes = [value["magnitude"] for value in converted_values]
         magnitude_min, magnitude_max = magnitude_range(vector_records, unit_system)
         norm = colors.Normalize(vmin=magnitude_min, vmax=magnitude_max)
-        colormap = cm.get_cmap(VELOCITY_COLORMAP)
+        colormap = plt.get_cmap(VELOCITY_COLORMAP)
         arrow_colors = [colormap(norm(magnitude)) for magnitude in magnitudes]
 
         ax.scatter(

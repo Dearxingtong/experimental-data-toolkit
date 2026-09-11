@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 
 def normalize_case_number(value: str) -> tuple[str | None, str | None]:
@@ -29,5 +29,10 @@ def position_workbook_filename(
     case_number: str,
     position_number: int,
     case_date: date,
+    start_datetime: datetime | None = None,
+    include_start_time: bool = False,
 ) -> str:
-    return f"C{case_number}_P{position_number:02d}_{format_case_date(case_date)}.xlsx"
+    start_suffix = ""
+    if include_start_time and start_datetime is not None:
+        start_suffix = f"_{start_datetime.strftime('%H%M')}"
+    return f"C{case_number}_P{position_number:02d}_{format_case_date(case_date)}{start_suffix}.xlsx"
