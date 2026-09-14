@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 import importlib.util
+import json
 import sys
 import types
 
@@ -16,6 +17,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import analysis_processor as analysis
 import dat_batch
 import dat_processor as dat
+import project_io
+import replicate_processor as replicate
 import time_splitter as splitter
 import vertical_profile_processor as vertical
 
@@ -1677,11 +1680,8 @@ def test_vertical_velocity_profile_averages_instantaneous_speed():
     assert profile[2][0] == expected_h3
 
 
-def test_vertical_normalization_formulas_do_not_clip_values():
-    assert vertical.normalize_height(4.375, 8.75) == 0.5
-    assert vertical.normalize_velocity(2.0, 0.5) == 4.0
-    assert vertical.normalize_temperature(30.0, 20.0, 25.0) == 2.0
-    assert vertical.normalize_concentration(350.0, 400.0, 500.0) == -0.5
+def test_vertical_profile_raw_mode_is_the_only_profile_mode():
+    assert vertical.PROFILE_MODES == ("Raw Profiles",)
 
 
 def test_vertical_temperature_auto_and_manual_mapping():
@@ -1702,7 +1702,7 @@ def test_vertical_contaminant_mapping_unit_and_summary():
         2,
         [2.0, 4.0, 6.0],
         ["Contaminant Concentration"],
-        "Normalized Profiles",
+        "Raw Profiles",
         8.75,
         "p2.csv",
         contaminant_columns=["CO2_A", "CO2_B", "CO2_C"],
@@ -1716,7 +1716,8 @@ def test_vertical_contaminant_mapping_unit_and_summary():
     assert records[0].unit == "ppm"
     assert records[0].contaminant_name == "CO2"
     summary = vertical.vertical_profile_records_to_dataframe(records)
-    assert "Normalized Value" in summary.columns
+    assert "Normalized Value" not in summary.columns
+    assert "Normalized Height" not in summary.columns
     assert list(summary["Source Column"]) == ["CO2_A", "CO2_B", "CO2_C"]
 
 
@@ -1727,7 +1728,7 @@ def test_vertical_build_records_for_three_variables_and_height_order():
         1,
         [6.0, 2.0, 4.0],
         ["Air Velocity", "Temperature", "Contaminant Concentration"],
-        "Normalized Profiles",
+        "Raw Profiles",
         8.75,
         "p1.csv",
         supply_velocity=2.5,
@@ -1744,7 +1745,8 @@ def test_vertical_build_records_for_three_variables_and_height_order():
     assert len(records) == 9
     velocity_records = [record for record in records if record.variable == "Air Velocity"]
     assert [record.height_ft for record in velocity_records] == [2.0, 4.0, 6.0]
-    assert velocity_records[0].normalized_value == 5.0 / 2.5
+    assert velocity_records[0].mean == 5.0
+    assert velocity_records[0].height_ft == 2.0
 
 
 def test_vertical_profile_variables_can_use_independent_source_files():
@@ -1766,7 +1768,7 @@ def test_vertical_profile_variables_can_use_independent_source_files():
         3,
         [2.0, 4.0, 6.0],
         ["Air Velocity", "Temperature", "Contaminant Concentration"],
-        "Normalized Profiles",
+        "Raw Profiles",
         8.75,
         supply_velocity=2.5,
         temperature_columns=["T_low", "T_mid", "T_high"],
@@ -1806,7 +1808,7 @@ def test_vertical_profile_missing_selected_variable_remains_blank_in_unified_sum
         1,
         [2.0, 4.0, 6.0],
         ["Air Velocity", "Temperature"],
-        "Normalized Profiles",
+        "Raw Profiles",
         8.75,
         supply_velocity=2.5,
         tin=20.0,
@@ -1820,22 +1822,458 @@ def test_vertical_profile_missing_selected_variable_remains_blank_in_unified_sum
     assert unified["Temperature Source File"].isna().all()
 
 
+def replicate_frames():
+    frames = []
+    for offset, filename in [(0.0, "rep1.csv"), (1.0, "rep2.csv"), (2.0, "rep3.csv")]:
+        frame = vertical_profile_dataframe().copy()
+        for column in ["Vx1", "Vy1", "Vz1", "Vx2", "Vy2", "Vz2", "Vx3", "Vy3", "Vz3", "Temp1", "Temp2", "Temp3", "CO2_A", "CO2_B", "CO2_C"]:
+            frame[column] = frame[column] + offset
+        frame["TIMESTAMP"] = pd.date_range("2026-09-10 12:00:00", periods=len(frame), freq="1s")
+        frame["Note"] = ["first", "second"]
+        frames.append(replicate.ReplicateDataset(filename, frame))
+    return frames
+
+
+def test_replicate_rowwise_mean_sd_measurement_sequence_alignment_and_exports():
+    datasets = replicate_frames()
+    datasets[1].dataframe["TIMESTAMP"] = pd.date_range("2026-09-10 14:15:00", periods=len(datasets[1].dataframe), freq="1s")
+    datasets[2].dataframe["TIMESTAMP"] = pd.date_range("2026-09-10 15:21:00", periods=len(datasets[2].dataframe), freq="1s")
+    processed, report, errors = replicate.rowwise_replicate_statistics(
+        datasets,
+        include_optional_numeric=False,
+    )
+    assert errors == []
+    assert report.method == "measurement_sequence"
+    assert report.matched_rows == 2
+    assert processed["TIMESTAMP"].iloc[0] == datasets[0].dataframe["TIMESTAMP"].iloc[0]
+    assert processed["Vx1"].iloc[0] == 4.0
+    assert processed["Vx1_std"].iloc[0] == 1.0
+    assert "Vx1_mean" not in processed.columns
+    assert "TIMESTAMP_std" not in processed.columns
+    assert "Note_std" not in processed.columns
+    assert processed["Note"].iloc[0] == "first"
+    vx1_index = list(processed.columns).index("Vx1")
+    assert list(processed.columns)[vx1_index + 1] == "Vx1_std"
+    assert replicate.dataframe_to_csv_bytes(processed).startswith(b"\xef\xbb\xbf")
+    assert replicate.dataframe_to_xlsx_bytes(processed).startswith(b"PK")
+    zip_bytes = replicate.build_replicate_zip([("processed.csv", b"csv"), ("summary.xlsx", b"xlsx")])
+    with ZipFile(BytesIO(zip_bytes)) as archive:
+        assert set(archive.namelist()) == {"processed.csv", "summary.xlsx"}
+
+
+def test_replicate_measurement_sequence_uses_common_minimum_row_count():
+    datasets = replicate_frames()
+    datasets[1] = replicate.ReplicateDataset(
+        datasets[1].filename,
+        pd.concat([datasets[1].dataframe, datasets[1].dataframe.iloc[[0]]], ignore_index=True),
+    )
+    datasets[2] = replicate.ReplicateDataset(
+        datasets[2].filename,
+        pd.concat([datasets[2].dataframe, datasets[2].dataframe.iloc[[0]], datasets[2].dataframe.iloc[[1]]], ignore_index=True),
+    )
+    processed, report, errors = replicate.rowwise_replicate_statistics(
+        datasets,
+        include_optional_numeric=False,
+    )
+    assert errors == []
+    assert report.method == "measurement_sequence"
+    assert report.matched_rows == 2
+    assert len(processed) == 2
+    assert report.unmatched_rows == {"rep1.csv": 0, "rep2.csv": 1, "rep3.csv": 2}
+
+
+def test_replicate_matching_columns_missing_column_rejection():
+    datasets = replicate_frames()
+    datasets[1] = replicate.ReplicateDataset(
+        datasets[1].filename,
+        datasets[1].dataframe.drop(columns=["Vx1"]),
+    )
+    columns, errors = replicate.matching_numeric_columns(datasets, include_optional_numeric=False)
+    assert columns == []
+    assert "Replicate 2 is missing column: Vx1." in errors
+
+
+def test_replicate_vertical_profile_mean_speed_and_between_replicate_sd():
+    datasets = replicate_frames()
+    records, errors = vertical.build_replicate_vertical_profile_records(
+        {"Air Velocity": [dataset.dataframe for dataset in datasets]},
+        {"Air Velocity": [dataset.filename for dataset in datasets]},
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+        supply_velocity=2.0,
+    )
+    assert errors == []
+    h1_record = [record for record in records if record.height_id == "H1"][0]
+    expected_replicate_means = []
+    for dataset in datasets:
+        speed = (dataset.dataframe["Vx1"] ** 2 + dataset.dataframe["Vy1"] ** 2 + dataset.dataframe["Vz1"] ** 2).pow(0.5)
+        expected_replicate_means.append(float(speed.mean()))
+    assert list(h1_record.replicate_means) == expected_replicate_means
+    assert h1_record.replicate_standard_deviation == pd.Series(expected_replicate_means).std(ddof=1)
+    assert h1_record.normalized_standard_deviation is None
+    assert h1_record.normalized_value is None
+
+
+def test_vertical_profile_uses_measurement_std_error_bars_for_multiple_positions():
+    p1_records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+        "p1.csv",
+    )
+    assert errors == []
+    p2_records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        2,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+        "p2.csv",
+    )
+    assert errors == []
+    records = p1_records + p2_records
+    assert vertical.records_have_plot_standard_deviation(records, "Raw Profiles")
+    assert vertical.profile_plot_standard_deviation(records[0], "Raw Profiles") == records[0].standard_deviation
+    if importlib.util.find_spec("matplotlib") is None:
+        return
+    fig = vertical.plot_vertical_profiles(records, ["Air Velocity"], "Raw Profiles", show_error_bars=True)
+    assert len(fig.axes) == 1
+    assert len(fig.axes[0].lines) >= 2
+    assert [text.get_text() for text in fig.legends[0].texts] == ["P1", "P2"]
+    assert vertical.export_vertical_profile_png(fig).startswith(b"\x89PNG")
+
+
+def test_vertical_profile_si_ip_axis_limits_and_unit_conversions():
+    records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        1,
+        [0.67, 2.0, 3.33],
+        ["Air Velocity", "Temperature"],
+        "Raw Profiles",
+        8.75,
+        "p1.csv",
+        temperature_columns=["Temp1", "Temp2", "Temp3"],
+    )
+    assert errors == []
+    velocity_record = [record for record in records if record.variable == "Air Velocity" and record.height_id == "H1"][0]
+    temperature_record = [record for record in records if record.variable == "Temperature" and record.height_id == "H1"][0]
+    assert round(0.35 * vertical.MPS_TO_FPM, 1) == 68.9
+    assert vertical.convert_profile_value(velocity_record, "ip") == velocity_record.mean * vertical.MPS_TO_FPM
+    assert vertical.convert_profile_standard_deviation(velocity_record, "Raw Profiles", "ip") == vertical.profile_plot_standard_deviation(velocity_record, "Raw Profiles") * vertical.MPS_TO_FPM
+    assert vertical.convert_profile_value(temperature_record, "ip") == temperature_record.mean * 9.0 / 5.0 + 32.0
+    assert vertical.convert_profile_standard_deviation(temperature_record, "Raw Profiles", "ip") == vertical.profile_plot_standard_deviation(temperature_record, "Raw Profiles") * 9.0 / 5.0
+    assert vertical.convert_profile_height(velocity_record, "si") == velocity_record.height_ft * 0.3048
+
+    if importlib.util.find_spec("matplotlib") is None:
+        return
+    si_fig = vertical.plot_vertical_profiles(records, ["Air Velocity", "Temperature"], "Raw Profiles", unit_system="si")
+    ip_fig = vertical.plot_vertical_profiles(records, ["Air Velocity", "Temperature"], "Raw Profiles", unit_system="ip")
+    si_velocity_axis, si_temperature_axis = si_fig.axes
+    ip_velocity_axis, ip_temperature_axis = ip_fig.axes
+    assert si_fig._suptitle.get_text() == "Vertical Profiles — SI Units"
+    assert ip_fig._suptitle.get_text() == "Vertical Profiles — IP Units"
+    assert si_velocity_axis.get_xlim() == (0.0, 0.35)
+    assert ip_velocity_axis.get_xlim() == (0.0, 70.0)
+    assert si_temperature_axis.get_xlim() == (23.0, 25.0)
+    assert ip_temperature_axis.get_xlim() == (73.0, 77.0)
+    assert si_velocity_axis.get_ylabel() == "Height (m)"
+    assert ip_velocity_axis.get_ylabel() == "Height (ft)"
+    assert si_velocity_axis.get_ylim() == (0.0, vertical.ROOM_HEIGHT_M)
+    assert ip_velocity_axis.get_ylim() == (0.0, 8.75)
+    assert si_velocity_axis.get_xlabel() == "Air velocity (m/s)"
+    assert ip_velocity_axis.get_xlabel() == "Air velocity (fpm)"
+    assert si_temperature_axis.get_xlabel() == "Temperature (°C)"
+    assert ip_temperature_axis.get_xlabel() == "Temperature (°F)"
+
+
+def test_vertical_profile_uses_raw_measurement_std_for_error_bars():
+    records, errors = vertical.build_vertical_profile_records(
+        vertical_profile_dataframe(),
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity", "Temperature"],
+        "Raw Profiles",
+        8.75,
+        "p1.csv",
+        supply_velocity=2.0,
+        temperature_columns=["Temp1", "Temp2", "Temp3"],
+        tin=20.0,
+        tout=30.0,
+    )
+    assert errors == []
+    velocity_record = [record for record in records if record.variable == "Air Velocity"][0]
+    temperature_record = [record for record in records if record.variable == "Temperature"][0]
+    assert velocity_record.normalized_standard_deviation is None
+    assert temperature_record.normalized_standard_deviation is None
+    assert vertical.profile_plot_standard_deviation(velocity_record, "Raw Profiles") == velocity_record.standard_deviation
+
+
+def test_vertical_profile_reads_replicate_generated_std_columns():
+    dataframe = vertical_profile_dataframe().copy()
+    dataframe["Vx1_std"] = 0.10
+    dataframe["Vy1_std"] = 0.20
+    dataframe["Vz1_std"] = 0.30
+    dataframe["Vx2_std"] = 0.11
+    dataframe["Vy2_std"] = 0.21
+    dataframe["Vz2_std"] = 0.31
+    dataframe["Vx3_std"] = 0.12
+    dataframe["Vy3_std"] = 0.22
+    dataframe["Vz3_std"] = 0.32
+    records, errors = vertical.build_vertical_profile_records_from_sources(
+        {"Air Velocity": dataframe},
+        {"Air Velocity": "replicate_mean.csv"},
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+        supply_velocity=2.0,
+    )
+    assert errors == []
+    h1 = [record for record in records if record.height_id == "H1"][0]
+    expected_std = (0.10**2 + 0.20**2 + 0.30**2) ** 0.5
+    assert abs(h1.standard_deviation - expected_std) < 1e-12
+    assert h1.normalized_standard_deviation is None
+    assert abs(h1.standard_deviation - expected_std) < 1e-12
+
+
+def test_replicate_temperature_and_contaminant_between_replicate_sd_and_normalized_sd():
+    datasets = replicate_frames()
+    records, errors = vertical.build_replicate_vertical_profile_records(
+        {
+            "Temperature": [dataset.dataframe for dataset in datasets],
+            "Contaminant Concentration": [dataset.dataframe for dataset in datasets],
+        },
+        {
+            "Temperature": [dataset.filename for dataset in datasets],
+            "Contaminant Concentration": [dataset.filename for dataset in datasets],
+        },
+        "Experimental",
+        2,
+        [2.0, 4.0, 6.0],
+        ["Temperature", "Contaminant Concentration"],
+        "Raw Profiles",
+        8.75,
+        temperature_columns=["Temp1", "Temp2", "Temp3"],
+        tin=20.0,
+        tout=30.0,
+        contaminant_columns=["CO2_A", "CO2_B", "CO2_C"],
+        contaminant_name="CO2",
+        concentration_unit="ppm",
+        cin=400.0,
+        cout=900.0,
+    )
+    assert errors == []
+    temp_h1 = [record for record in records if record.variable == "Temperature" and record.height_id == "H1"][0]
+    co2_h1 = [record for record in records if record.variable == "Contaminant Concentration" and record.height_id == "H1"][0]
+    assert temp_h1.replicate_standard_deviation == pd.Series(temp_h1.replicate_means).std(ddof=1)
+    assert temp_h1.normalized_standard_deviation is None
+    assert co2_h1.replicate_standard_deviation == pd.Series(co2_h1.replicate_means).std(ddof=1)
+    assert co2_h1.normalized_standard_deviation is None
+
+
+def test_vertical_profile_plot_uses_horizontal_replicate_error_bars_and_handles_single_replicate():
+    datasets = replicate_frames()
+    records, errors = vertical.build_replicate_vertical_profile_records(
+        {"Air Velocity": [dataset.dataframe for dataset in datasets]},
+        {"Air Velocity": [dataset.filename for dataset in datasets]},
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+    )
+    assert errors == []
+    if importlib.util.find_spec("matplotlib") is None:
+        return
+    fig = vertical.plot_vertical_profiles(records, ["Air Velocity"], "Raw Profiles", show_error_bars=True)
+    assert len(fig.axes[0].collections) >= 1
+    single_records, single_errors = vertical.build_replicate_vertical_profile_records(
+        {"Air Velocity": [datasets[0].dataframe]},
+        {"Air Velocity": [datasets[0].filename]},
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+    )
+    assert single_errors == []
+    assert all(record.replicate_standard_deviation is None for record in single_records)
+    vertical.plot_vertical_profiles(single_records, ["Air Velocity"], "Raw Profiles", show_error_bars=True)
+
+
+def sample_project_components():
+    vector_records = [
+        analysis.VectorRecord(1, 1, 2.67, 2.5, 2.0, 0.1, 0.2, 0.3, (0.1**2 + 0.2**2 + 0.3**2) ** 0.5, "p1.csv")
+    ]
+    vertical_records, errors = vertical.build_replicate_vertical_profile_records(
+        {"Air Velocity": [dataset.dataframe for dataset in replicate_frames()]},
+        {"Air Velocity": [dataset.filename for dataset in replicate_frames()]},
+        "Experimental",
+        1,
+        [2.0, 4.0, 6.0],
+        ["Air Velocity"],
+        "Raw Profiles",
+        8.75,
+        supply_velocity=2.0,
+    )
+    assert errors == []
+    processed, report, errors = replicate.rowwise_replicate_statistics(replicate_frames(), include_optional_numeric=False)
+    assert errors == []
+    replicate_state = {
+        "position_number": 1,
+        "case_number": "03",
+        "case_date": "2026-08-25",
+        "replicate_count": 3,
+        "source_files": ["rep1.csv", "rep2.csv", "rep3.csv"],
+        "alignment": {
+            "method": report.method,
+            "matched_rows": report.matched_rows,
+            "unmatched_rows": report.unmatched_rows,
+        },
+        "base_name": "C03_P01_ReplicateMeanSD",
+        "processed_dataframe": processed,
+        "summary_dataframe": replicate.summary_statistics(processed),
+    }
+    return vector_records, vertical_records, replicate_state
+
+
+def test_project_archive_creation_and_round_trip_for_all_analysis_state():
+    vector_records, vertical_records, replicate_state = sample_project_components()
+    state = project_io.build_project_state(
+        case_number="03",
+        case_date="2026-08-25",
+        vector_records=vector_records,
+        vector_settings={"camera": {"azimuth": 22, "elevation": 18, "roll": 1}},
+        vertical_records=vertical_records,
+        vertical_settings={
+            "selected_variables": ["Air Velocity"],
+            "profile_mode": "Raw Profiles",
+            "show_error_bars": True,
+            "contaminant_name": "CO2",
+            "concentration_unit": "ppm",
+            "normalization": {"room_height_ft": 8.75, "supply_velocity": 2.0, "tin": 20, "tout": 25, "cin": 400, "cout": 900},
+        },
+        replicate_analysis=replicate_state,
+    )
+    archive_bytes = project_io.save_project_archive(state)
+    with ZipFile(BytesIO(archive_bytes)) as archive:
+        assert {"project.json", "metadata.json", "vector_summary.csv", "vertical_profile_summary.csv", "replicate_processed.csv", "replicate_summary.csv"}.issubset(set(archive.namelist()))
+        project_json = json.loads(archive.read("project.json").decode("utf-8"))
+        assert project_json["format_version"] == 1
+        assert project_json["metadata"]["format_version"] == 1
+
+    loaded = project_io.load_project_archive(archive_bytes)
+    decoded = project_io.decode_project_state(loaded)
+    assert decoded["vector_records"][0].position_number == 1
+    assert decoded["vector_settings"]["camera"] == {"azimuth": 22, "elevation": 18, "roll": 1}
+    assert decoded["vertical_settings"]["show_error_bars"] is True
+    assert decoded["vertical_settings"]["contaminant_name"] == "CO2"
+    assert decoded["vertical_settings"]["normalization"]["supply_velocity"] == 2.0
+    assert decoded["vertical_records"][0].replicate_standard_deviation is not None
+    assert decoded["replicate_analysis"]["alignment"]["matched_rows"] == 2
+    loaded_processed = decoded["replicate_analysis"]["processed_dataframe"]
+    assert list(loaded_processed.columns) == list(replicate_state["processed_dataframe"].columns)
+    assert loaded_processed.shape == replicate_state["processed_dataframe"].shape
+    assert list(loaded_processed["Vx1"]) == list(replicate_state["processed_dataframe"]["Vx1"])
+    assert project_io.save_project_archive(loaded).startswith(b"PK")
+
+
+def test_project_load_rejects_malformed_missing_and_unsupported_projects():
+    try:
+        project_io.load_project_archive(b"not a zip")
+        assert False
+    except project_io.ProjectLoadError as exc:
+        assert "not a valid" in str(exc)
+
+    output = BytesIO()
+    with ZipFile(output, "w") as archive:
+        archive.writestr("metadata.json", "{}")
+    try:
+        project_io.load_project_archive(output.getvalue())
+        assert False
+    except project_io.ProjectLoadError as exc:
+        assert "missing project.json" in str(exc)
+
+    output = BytesIO()
+    with ZipFile(output, "w") as archive:
+        archive.writestr("project.json", '{"format_version": 999}')
+    try:
+        project_io.load_project_archive(output.getvalue())
+        assert False
+    except project_io.ProjectLoadError as exc:
+        assert "Unsupported project format_version" in str(exc)
+
+
+def test_loaded_project_can_restore_session_and_regenerate_outputs():
+    vector_records, vertical_records, replicate_state = sample_project_components()
+    state = project_io.build_project_state(
+        case_number="03",
+        case_date="2026-08-25",
+        vector_records=vector_records,
+        vector_settings={"camera": {"azimuth": 12, "elevation": 13, "roll": 0}},
+        vertical_records=vertical_records,
+        vertical_settings={"selected_variables": ["Air Velocity"], "profile_mode": "Raw Profiles", "show_error_bars": True},
+        replicate_analysis=replicate_state,
+    )
+    app = load_app_module()
+    app.st.session_state = {}
+    summary = app.restore_project_to_session(project_io.load_project_archive(project_io.save_project_archive(state)))
+    assert summary["project"] == "03"
+    assert app.st.session_state["analysis_vector_records"][0].source_filename == "p1.csv"
+    assert app.st.session_state["analysis_camera_azimuth"] == 12
+    assert app.st.session_state["vertical_profile_show_error_bars"] is True
+    assert app.st.session_state["replicate_analysis_state"]["summary_dataframe"] is not None
+    si_fig = analysis.plot_3d_air_vectors(app.st.session_state["analysis_vector_records"], "si", 12, 13, 0)
+    assert analysis.export_figure_png(si_fig).startswith(b"\x89PNG")
+    vp_fig = vertical.plot_vertical_profiles(app.st.session_state["vertical_profile_records"], ["Air Velocity"], "Raw Profiles", show_error_bars=True)
+    assert vertical.export_vertical_profile_png(vp_fig).startswith(b"\x89PNG")
+
+
+def test_start_new_analysis_clears_only_data_analysis_state():
+    app = load_app_module()
+    app.st.session_state = {
+        "dat_completed_cases": ["keep"],
+        "analysis_vector_records": [analysis.VectorRecord(1, 1, 2.67, 2.5, 2.0, 0.1, 0.2, 0.3, 0.4, "p1.csv")],
+        "vertical_profile_records": ["profile"],
+        "replicate_analysis_state": {"x": 1},
+    }
+    app.clear_data_analysis_project_state()
+    assert app.st.session_state["dat_completed_cases"] == ["keep"]
+    assert app.st.session_state["analysis_vector_records"] == []
+    assert app.st.session_state["vertical_profile_records"] == []
+    assert app.st.session_state["replicate_analysis_state"] == {}
+
+
 def test_vertical_validation_rejects_missing_inputs_and_future_cfd():
     errors = vertical.validate_profile_heights([0, 9], 8.75)
     assert "Height 1 must be greater than 0 ft." in errors
     assert "Height 2 must be less than or equal to the room height." in errors
     norm_errors = vertical.validate_normalization_inputs(
         ["Air Velocity", "Temperature", "Contaminant Concentration"],
-        "Normalized Profiles",
+        "Raw Profiles",
         supply_velocity=0,
         tin=20,
         tout=20,
         cin=1,
         cout=1,
     )
-    assert "Supply Air Velocity Us must be greater than 0 m/s." in norm_errors
-    assert "Tout must not equal Tin for normalized temperature." in norm_errors
-    assert "Cout must not equal Cin for normalized concentration." in norm_errors
+    assert norm_errors == []
     _records, cfd_errors = vertical.build_vertical_profile_records(
         vertical_profile_dataframe(),
         "CFD",
@@ -1866,25 +2304,30 @@ def test_vertical_plot_exports_and_zip():
         requirements = (PROJECT_ROOT / "requirements.txt").read_text()
         assert "matplotlib" in requirements
     else:
-        fig = vertical.plot_vertical_profiles(records, ["Air Velocity", "Temperature"], "Raw Profiles")
-        eps_bytes = vertical.export_vertical_profile_eps(fig)
-        png_bytes = vertical.export_vertical_profile_png(fig)
-        assert eps_bytes.startswith(b"%!PS-Adobe")
-        assert png_bytes.startswith(b"\x89PNG")
+        si_fig = vertical.plot_vertical_profiles(records, ["Air Velocity", "Temperature"], "Raw Profiles", unit_system="si")
+        ip_fig = vertical.plot_vertical_profiles(records, ["Air Velocity", "Temperature"], "Raw Profiles", unit_system="ip")
+        assert vertical.export_vertical_profile_eps(si_fig).startswith(b"%!PS-Adobe")
+        assert vertical.export_vertical_profile_png(si_fig).startswith(b"\x89PNG")
+        assert vertical.export_vertical_profile_eps(ip_fig).startswith(b"%!PS-Adobe")
+        assert vertical.export_vertical_profile_png(ip_fig).startswith(b"\x89PNG")
     csv_bytes = vertical.vertical_profile_summary_csv(records)
     xlsx_bytes = vertical.vertical_profile_summary_xlsx(records)
     zip_bytes = vertical.build_vertical_profile_zip(
         [
-            ("Vertical_Profile_Raw.eps", b"eps"),
-            ("Vertical_Profile_Raw.png", b"png"),
+            ("Vertical_Profiles_SI.eps", b"eps"),
+            ("Vertical_Profiles_SI.png", b"png"),
+            ("Vertical_Profiles_IP.eps", b"eps"),
+            ("Vertical_Profiles_IP.png", b"png"),
             ("Vertical_Profile_Summary.csv", csv_bytes),
             ("Vertical_Profile_Summary.xlsx", xlsx_bytes),
         ]
     )
     with ZipFile(BytesIO(zip_bytes)) as archive:
         assert set(archive.namelist()) == {
-            "Vertical_Profile_Raw.eps",
-            "Vertical_Profile_Raw.png",
+            "Vertical_Profiles_SI.eps",
+            "Vertical_Profiles_SI.png",
+            "Vertical_Profiles_IP.eps",
+            "Vertical_Profiles_IP.png",
             "Vertical_Profile_Summary.csv",
             "Vertical_Profile_Summary.xlsx",
         }
@@ -1897,7 +2340,7 @@ def test_vertical_plot_uses_separate_figure_title_and_shared_legend():
         1,
         [2.0, 4.0, 6.0],
         ["Air Velocity", "Temperature", "Contaminant Concentration"],
-        "Normalized Profiles",
+        "Raw Profiles",
         8.75,
         "p1.csv",
         supply_velocity=2.5,
@@ -1917,11 +2360,11 @@ def test_vertical_plot_uses_separate_figure_title_and_shared_legend():
     fig = vertical.plot_vertical_profiles(
         records,
         ["Air Velocity", "Temperature", "Contaminant Concentration"],
-        "Normalized Profiles",
+        "Raw Profiles",
         "CO2",
         "ppm",
     )
-    assert fig._suptitle.get_text() == "Normalized Vertical Profiles"
+    assert fig._suptitle.get_text() == "Vertical Profiles — SI Units"
     assert len(fig.legends) == 1
     assert [text.get_text() for text in fig.legends[0].texts] == ["P1"]
     assert all(axis.get_legend() is None for axis in fig.axes)
@@ -2032,27 +2475,178 @@ def test_app_uses_data_analysis_tab_instead_of_split_by_time_tab():
 
 def test_data_analysis_landing_contains_3d_and_vertical_methods():
     app_source = (PROJECT_ROOT / "app.py").read_text()
+    landing_body = app_source.split("def render_data_analysis_landing", 1)[1].split(
+        "def render_data_analysis_tool",
+        1,
+    )[0]
     assert "Choose an analysis method" in app_source
-    assert "3D Vector Plot" in app_source
-    assert "Visualize 3D airflow direction and velocity magnitude in the room." in app_source
-    assert "Vertical Profile Plot" in app_source
-    assert "Plot vertical distributions of air velocity, temperature, and contaminant concentration." in app_source
+    assert "3D Vector Plot" in landing_body
+    assert "Visualize 3D airflow direction and velocity magnitude in the room." in landing_body
+    assert "Vertical Profile Plot" in landing_body
+    assert "Plot vertical distributions of air velocity, temperature, and contaminant concentration." in landing_body
+    assert "Replicate Mean & SD" not in landing_body
+    assert "select_replicate_mean_sd" not in landing_body
     assert "render_3d_vector_plot_tool" in app_source
     assert "render_vertical_profile_tool" in app_source
+
+
+def test_replicate_mean_sd_is_under_merge_csv():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    merge_body = app_source.split("def render_merge_csv_tool", 1)[1].split(
+        "def render_workbook_analysis",
+        1,
+    )[0]
+    assert "Processing mode" in merge_body
+    assert "Standard Merge" in merge_body
+    assert "Replicate Mean & SD" in merge_body
+    assert "render_replicate_mean_sd_tool(show_back_button=False)" in merge_body
+
+
+def test_replicate_mean_sd_ui_has_three_required_uploaders_and_guard():
+    app = load_app_module()
+    assert app.validate_required_replicate_uploads([object(), None, None]) == (
+        [],
+        "Please upload all 3 replicate CSV files before processing.",
+    )
+    assert app.validate_required_replicate_uploads([object(), object(), None]) == (
+        [],
+        "Please upload all 3 replicate CSV files before processing.",
+    )
+    ready_uploads, error = app.validate_required_replicate_uploads([object(), object(), object()])
+    assert error is None
+    assert len(ready_uploads) == 3
+
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    replicate_body = app_source.split("def render_replicate_mean_sd_tool", 1)[1].split(
+        "def render_project_controls",
+        1,
+    )[0]
+    assert "Replicate 1 CSV" in replicate_body
+    assert "Replicate 2 CSV" in replicate_body
+    assert "Replicate 3 CSV" in replicate_body
+    assert "key=f\"replicate_file_1_{input_version}\"" in replicate_body
+    assert "key=f\"replicate_file_2_{input_version}\"" in replicate_body
+    assert "key=f\"replicate_file_3_{input_version}\"" in replicate_body
+    assert "accept_multiple_files=False" in replicate_body
+    assert "accept_multiple_files=True" not in replicate_body
+    assert "for uploaded_file in ready_uploads" in replicate_body
+    assert "rowwise_replicate_statistics(" in replicate_body
+
+
+def test_replicate_mean_sd_feedback_next_case_and_duplicate_workflow_source():
+    app_source = (PROJECT_ROOT / "app.py").read_text()
+    replicate_body = app_source.split("def render_replicate_mean_sd_tool", 1)[1].split(
+        "def render_project_controls",
+        1,
+    )[0]
+    assert 'st.spinner("Processing replicate files...")' in replicate_body
+    assert "Replicate processing completed successfully." in replicate_body
+    assert "awaiting_next_case_choice" in replicate_body
+    assert "## Process another case?" in replicate_body
+    assert "Yes, process another case" in replicate_body
+    assert "No, finish" in replicate_body
+    assert "reset_current_replicate_inputs()" in replicate_body
+    assert "has already been processed in this session" in replicate_body
+    assert "I want to intentionally reprocess this case" in replicate_body
+    assert "completed_cases.append(completed_case)" in replicate_body
+
+
+def test_replicate_next_case_reset_preserves_completed_cases_and_other_state():
+    app = load_app_module()
+    processed, report, errors = replicate.rowwise_replicate_statistics(replicate_frames(), include_optional_numeric=False)
+    assert errors == []
+    completed_case = {
+        "case_key": app.replicate_case_key("03", 1, "2026-08-25"),
+        "position_number": 1,
+        "case_number": "03",
+        "case_date": "2026-08-25",
+        "aligned_observations": report.matched_rows,
+        "base_name": "C03_P01_ReplicateMeanSD",
+        "summary_base_name": "C03_P01_ReplicateSummary",
+        "processed_dataframe": processed,
+        "summary_dataframe": replicate.summary_statistics(processed),
+    }
+    app.st.session_state = {
+        "replicate_input_version": 4,
+        "replicate_analysis_state": {
+            "completed_cases": [completed_case],
+            "processed_dataframe": processed,
+            "summary_dataframe": replicate.summary_statistics(processed),
+            "base_name": "C03_P01_ReplicateMeanSD",
+            "awaiting_next_case_choice": True,
+        },
+        "dat_completed_cases": ["keep-dat"],
+        "analysis_vector_records": ["keep-vector"],
+        "vertical_profile_records": ["keep-vertical"],
+        "project_metadata": {"case_number": "keep-project"},
+    }
+    app.reset_current_replicate_inputs()
+    assert app.st.session_state["replicate_input_version"] == 5
+    state = app.st.session_state["replicate_analysis_state"]
+    assert state["completed_cases"] == [completed_case]
+    assert state["processed_dataframe"] is None
+    assert state["summary_dataframe"] is None
+    assert state["base_name"] is None
+    assert state["awaiting_next_case_choice"] is False
+    assert app.st.session_state["dat_completed_cases"] == ["keep-dat"]
+    assert app.st.session_state["analysis_vector_records"] == ["keep-vector"]
+    assert app.st.session_state["vertical_profile_records"] == ["keep-vertical"]
+    assert app.st.session_state["project_metadata"] == {"case_number": "keep-project"}
+
+
+def test_replicate_completed_cases_summary_zip_and_duplicate_detection():
+    app = load_app_module()
+    processed, report, errors = replicate.rowwise_replicate_statistics(replicate_frames(), include_optional_numeric=False)
+    assert errors == []
+    case_one = {
+        "case_key": app.replicate_case_key("03", 1, "2026-08-25"),
+        "position_number": 1,
+        "case_number": "03",
+        "case_date": "2026-08-25",
+        "aligned_observations": report.matched_rows,
+        "base_name": "C03_P01_ReplicateMeanSD",
+        "summary_base_name": "C03_P01_ReplicateSummary",
+        "processed_dataframe": processed,
+        "summary_dataframe": replicate.summary_statistics(processed),
+    }
+    case_two = {
+        **case_one,
+        "case_key": app.replicate_case_key("03", 2, "2026-08-25"),
+        "position_number": 2,
+        "base_name": "C03_P02_ReplicateMeanSD",
+        "summary_base_name": "C03_P02_ReplicateSummary",
+    }
+    app.st.session_state = {"replicate_analysis_state": {"completed_cases": [case_one, case_two]}}
+    assert app.is_duplicate_replicate_case("03", 1, "2026-08-25") is True
+    assert app.is_duplicate_replicate_case("03", 3, "2026-08-25") is False
+    zip_bytes = app.build_all_replicate_cases_zip(app.completed_replicate_cases())
+    with ZipFile(BytesIO(zip_bytes)) as archive:
+        names = set(archive.namelist())
+        assert "C03_P01_ReplicateMeanSD.csv" in names
+        assert "C03_P01_ReplicateMeanSD.xlsx" in names
+        assert "C03_P02_ReplicateMeanSD.csv" in names
+        assert "C03_P02_ReplicateMeanSD.xlsx" in names
 
 
 def test_vertical_profile_workflow_source_contains_required_controls():
     app_source = (PROJECT_ROOT / "app.py").read_text()
     assert "Reset Vertical Profile Analysis" in app_source
-    assert "Do you want to add another position dataset?" in app_source
+    assert "Continue this case" in app_source
+    assert "Start new case analysis" in app_source
+    assert "Standard deviation columns were not found, so the profile was plotted without error bars." in app_source
     assert "Dataset Type" in app_source
     assert "CFD input support is reserved for a future update." in app_source
     assert "Air Velocity" in app_source
     assert "Temperature" in app_source
     assert "Contaminant Concentration" in app_source
-    assert "Normalized Profiles" in app_source
-    assert "Room Height H (ft)" in app_source
-    assert "Supply Air Velocity Us (m/s)" in app_source
+    assert "Raw Profiles" in app_source
+    assert "Normalized Profiles" not in app_source
+    assert "Room Height H (ft)" not in app_source
+    assert "Supply Air Velocity Us (m/s)" not in app_source
+    assert "Supply / Inlet Temperature Tin" not in app_source
+    assert "Exhaust / Outlet Temperature Tout" not in app_source
+    assert "Supply / Background Concentration Cin" not in app_source
+    assert "Exhaust Concentration Cout" not in app_source
     assert "Velocity CSV upload" in app_source
     assert "Temperature CSV upload" in app_source
     assert "Contaminant CSV upload" in app_source
@@ -2061,6 +2655,8 @@ def test_vertical_profile_workflow_source_contains_required_controls():
     assert "Height 1 Temperature Column" in app_source
     assert "Height 1 Concentration Column" in app_source
     assert "Download All Vertical Profile Files" in app_source
+    assert "Show replicate SD error bars" in app_source
+    assert "Use replicate files for this position" in app_source
 
 
 def run_all_tests():
@@ -2143,12 +2739,26 @@ def run_all_tests():
         test_analysis_interactive_plot_dependency_is_declared_or_available,
         test_interactive_origin_markers_match_vector_start_points,
         test_vertical_velocity_profile_averages_instantaneous_speed,
-        test_vertical_normalization_formulas_do_not_clip_values,
+        test_vertical_profile_raw_mode_is_the_only_profile_mode,
         test_vertical_temperature_auto_and_manual_mapping,
         test_vertical_contaminant_mapping_unit_and_summary,
         test_vertical_build_records_for_three_variables_and_height_order,
         test_vertical_profile_variables_can_use_independent_source_files,
         test_vertical_profile_missing_selected_variable_remains_blank_in_unified_summary,
+        test_replicate_rowwise_mean_sd_measurement_sequence_alignment_and_exports,
+        test_replicate_measurement_sequence_uses_common_minimum_row_count,
+        test_replicate_matching_columns_missing_column_rejection,
+        test_replicate_vertical_profile_mean_speed_and_between_replicate_sd,
+        test_vertical_profile_uses_measurement_std_error_bars_for_multiple_positions,
+        test_vertical_profile_si_ip_axis_limits_and_unit_conversions,
+        test_vertical_profile_uses_raw_measurement_std_for_error_bars,
+        test_vertical_profile_reads_replicate_generated_std_columns,
+        test_replicate_temperature_and_contaminant_between_replicate_sd_and_normalized_sd,
+        test_vertical_profile_plot_uses_horizontal_replicate_error_bars_and_handles_single_replicate,
+        test_project_archive_creation_and_round_trip_for_all_analysis_state,
+        test_project_load_rejects_malformed_missing_and_unsupported_projects,
+        test_loaded_project_can_restore_session_and_regenerate_outputs,
+        test_start_new_analysis_clears_only_data_analysis_state,
         test_vertical_validation_rejects_missing_inputs_and_future_cfd,
         test_vertical_plot_exports_and_zip,
         test_vertical_plot_uses_separate_figure_title_and_shared_legend,
@@ -2160,6 +2770,11 @@ def run_all_tests():
         test_app_manual_slider_changes_update_canonical_camera,
         test_app_uses_data_analysis_tab_instead_of_split_by_time_tab,
         test_data_analysis_landing_contains_3d_and_vertical_methods,
+        test_replicate_mean_sd_is_under_merge_csv,
+        test_replicate_mean_sd_ui_has_three_required_uploaders_and_guard,
+        test_replicate_mean_sd_feedback_next_case_and_duplicate_workflow_source,
+        test_replicate_next_case_reset_preserves_completed_cases_and_other_state,
+        test_replicate_completed_cases_summary_zip_and_duplicate_detection,
         test_vertical_profile_workflow_source_contains_required_controls,
     ]
     for test in tests:

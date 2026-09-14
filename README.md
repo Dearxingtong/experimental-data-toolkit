@@ -7,8 +7,8 @@ Experimental Data Toolkit is a lightweight Streamlit web application for routine
 The MVP includes three tools:
 
 - **DAT → XLSX**: Process one experimental `.dat` file at a time, assign Case No, optionally split into user-defined measurement intervals for physical Positions P1-P6, and download XLSX and CSV outputs.
-- **Merge CSV Files**: Upload two or more `.csv` files, preview each file, merge them vertically by rows, and download the merged result as CSV or XLSX.
-- **Data Analysis**: Choose between a 3D airflow vector plot workflow and a vertical profile plotting workflow for experimental room data.
+- **Merge CSV Files**: Upload CSV files, choose standard vertical merge or replicate mean/standard-deviation processing, and download CSV/XLSX/ZIP outputs.
+- **Data Analysis**: Choose between 3D vector plotting and vertical profile plotting workflows for experimental room data.
 
 The application reads uploaded files in memory and does not modify the original input files.
 
@@ -56,14 +56,33 @@ Then open the local Streamlit URL shown in your terminal.
 
 ### Merge CSV Files
 
+- Choose a processing mode:
+  - **Standard Merge** keeps the existing vertical CSV merge workflow.
+  - **Replicate Mean & SD** combines repeated measurement files into row-wise means and sample standard deviations.
+
+#### Standard Merge
+
 - Upload two or more CSV files.
 - Merge files vertically by rows.
-- Choose between:
+- Choose a column handling mode:
   - **Require identical columns**: all files must have the same column names and column order.
   - **Keep all columns**: creates the union of all columns and preserves missing values as blank/NaN.
 - Optionally add a `_source_file` column for traceability.
 - Preview the merged result.
 - Download the merged output as CSV or XLSX.
+
+#### Replicate Mean & SD
+
+- Upload three or more replicate CSV files for repeated measurements.
+- Default alignment is **Measurement sequence**, which combines rows by row index rather than exact timestamp.
+- Exact `TIMESTAMP` alignment remains available as an advanced option.
+- When measurement-sequence alignment is used, the output `TIMESTAMP` comes from Replicate 1.
+- If replicate files have different row counts, processing uses the common minimum row count and reports trailing rows excluded from each longer file.
+- Numeric output columns preserve the original variable names for means, such as `U1`, and place the matching sample standard deviation column immediately after it, such as `U1_std`.
+- `TIMESTAMP_std` is not created. Non-numeric metadata columns are copied from Replicate 1 without `_std` columns.
+- Sample standard deviation uses `ddof=1`.
+- Missing important numeric columns are rejected with a clear error.
+- Download averaged outputs as CSV/XLSX, summary outputs as CSV/XLSX, or one combined ZIP.
 
 ### Data Analysis
 
@@ -71,6 +90,14 @@ The Data Analysis tab starts with a simple method selector:
 
 - **3D Vector Plot** for combined 3D airflow vector maps.
 - **Vertical Profile Plot** for vertical distributions of air velocity, temperature, and contaminant concentration.
+
+The top of the Data Analysis tab also includes project controls:
+
+- **Save Project** downloads a local `.edtproj` file containing processed analysis state.
+- **Load Existing Project** restores processed 3D vector and vertical profile analysis data without re-uploading original measurement files.
+- **Start New Analysis** clears only Data Analysis project state, leaving DAT → XLSX and Merge CSV state alone.
+
+Project files are ZIP-based archives with `project.json`, `metadata.json`, and processed CSV tables when available. Version 1 stores processed data and settings only; original uploaded CSV/DAT files are intentionally not embedded.
 
 #### 3D Vector Plot
 
@@ -98,9 +125,14 @@ The Data Analysis tab starts with a simple method selector:
 - Temperature uses `Temp1`, `Temp2`, and `Temp3` when available, or manually selected numeric columns.
 - Contaminant concentration uses manually selected numeric columns plus a contaminant name and unit.
 - Source files do not need timestamp alignment because the vertical profile workflow uses per-height summary statistics.
+- Optionally upload replicate files per variable. Replicate error bars use between-replicate SD of per-file profile means, not within-file time-series SD.
+- Averaged replicate files from Merge CSV are also recognized because mean columns keep the original variable names, with adjacent `_std` columns available for reference.
 - The summary table combines values by Position and Height, with missing variables left blank.
-- Raw Profiles plot measured means against height in feet.
-- Normalized Profiles plot `Z = z / H`, `U* = U / Us`, `theta = (T - Tin) / (Tout - Tin)`, and `C* = (C - Cin) / (Cout - Cin)`.
+- Vertical Profile plots use raw physical values only: measured variable means against actual height in feet.
+- The app generates equivalent SI and IP publication figures from the same canonical raw records.
+- SI plots use height in meters, air velocity in m/s, temperature in °C, and contaminant concentration in the user-selected unit.
+- IP plots use height in feet, air velocity in fpm, temperature in °F, and the same contaminant concentration unit.
+- Fixed comparable profile ranges are used for velocity and temperature across cases.
 - CFD and Experimental vs CFD input support is reserved for a future update.
 - Download EPS and 300 dpi PNG figures, CSV/XLSX summary tables, or one combined ZIP.
 

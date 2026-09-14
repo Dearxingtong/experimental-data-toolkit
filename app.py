@@ -37,6 +37,22 @@ from dat_processor import (
     process_dat_upload,
     velocity_transform_description,
 )
+from replicate_processor import (
+    ReplicateDataset,
+    build_replicate_zip,
+    dataframe_to_csv_bytes as replicate_dataframe_to_csv_bytes,
+    dataframe_to_xlsx_bytes as replicate_dataframe_to_xlsx_bytes,
+    rowwise_replicate_statistics,
+    summary_statistics as replicate_summary_statistics,
+)
+from project_io import (
+    ProjectLoadError,
+    build_project_state,
+    decode_project_state,
+    load_project_archive,
+    project_filename,
+    save_project_archive,
+)
 from time_splitter import (
     PositionRange,
     WorkbookAnalysis,
@@ -58,8 +74,8 @@ from time_splitter import (
 from vertical_profile_processor import (
     DATASET_TYPES,
     DEFAULT_ROOM_HEIGHT_FT,
-    PROFILE_MODES,
     build_vertical_profile_records_from_sources,
+    build_replicate_vertical_profile_records,
     build_vertical_profile_records,
     build_vertical_profile_zip,
     default_temperature_columns,
@@ -67,6 +83,7 @@ from vertical_profile_processor import (
     export_vertical_profile_png,
     numeric_columns,
     plot_vertical_profiles,
+    records_have_plot_standard_deviation,
     vertical_profile_records_to_dataframe,
     vertical_profile_records_to_unified_dataframe,
     vertical_profile_summary_csv,
@@ -992,6 +1009,16 @@ def merge_datasets(
 
 def render_merge_csv_tool() -> None:
     st.subheader("Merge CSV Files")
+    processing_mode = st.radio(
+        "Processing mode",
+        options=("Standard Merge", "Replicate Mean & SD"),
+        horizontal=True,
+        key="merge_processing_mode",
+    )
+    if processing_mode == "Replicate Mean & SD":
+        render_replicate_mean_sd_tool(show_back_button=False)
+        return
+
     uploaded_files = st.file_uploader(
         "Upload two or more CSV files",
         type=["csv"],
@@ -1259,6 +1286,106 @@ def reset_analysis() -> None:
         "analysis_uploader_version",
         0,
     ) + 1
+
+
+def clear_data_analysis_project_state() -> None:
+    reset_analysis()
+    reset_vertical_profile_analysis()
+    st.session_state["analysis_method"] = None
+    st.session_state["replicate_analysis_state"] = {}
+    st.session_state["project_metadata"] = {}
+    st.session_state["loaded_project_summary"] = None
+
+
+def current_project_case_metadata() -> tuple[str | None, str | None]:
+    metadata = st.session_state.get("project_metadata") or {}
+    case_number = metadata.get("case_number")
+    case_date = metadata.get("case_date")
+    replicate_state = st.session_state.get("replicate_analysis_state") or {}
+    if not case_number:
+        case_number = replicate_state.get("case_number")
+    if not case_date:
+        case_date = replicate_state.get("case_date")
+    return case_number, case_date
+
+
+def build_current_project_state() -> dict:
+    case_number, case_date = current_project_case_metadata()
+    vector_settings = {
+        "camera": {
+            "azimuth": st.session_state.get("analysis_camera_azimuth", ANALYSIS_CAMERA_DEFAULTS["azimuth"]),
+            "elevation": st.session_state.get("analysis_camera_elevation", ANALYSIS_CAMERA_DEFAULTS["elevation"]),
+            "roll": st.session_state.get("analysis_camera_roll", ANALYSIS_CAMERA_DEFAULTS["roll"]),
+        },
+        "unit_outputs": ["si", "imperial"],
+    }
+    vertical_settings = {
+        "selected_variables": st.session_state.get("vertical_profile_selected_variables", []),
+        "profile_mode": "Raw Profiles",
+        "show_error_bars": st.session_state.get("vertical_profile_show_error_bars", True),
+        "contaminant_name": st.session_state.get("vertical_profile_contaminant_name", "Contaminant"),
+        "concentration_unit": st.session_state.get("vertical_profile_concentration_unit", ""),
+    }
+    return build_project_state(
+        case_number=case_number,
+        case_date=case_date,
+        vector_records=st.session_state.get("analysis_vector_records", []),
+        vector_settings=vector_settings,
+        vertical_records=st.session_state.get("vertical_profile_records", []),
+        vertical_settings=vertical_settings,
+        replicate_analysis=st.session_state.get("replicate_analysis_state", {}),
+        ui_preferences={"analysis_method": st.session_state.get("analysis_method")},
+    )
+
+
+def restore_project_to_session(project_state: dict) -> dict:
+    decoded = decode_project_state(project_state)
+    init_analysis_state()
+    init_vertical_profile_state()
+
+    st.session_state["project_metadata"] = decoded["metadata"]
+    st.session_state["analysis_vector_records"] = decoded["vector_records"]
+    st.session_state["analysis_finished"] = bool(decoded["vector_records"])
+    st.session_state["analysis_awaiting_continue"] = False
+    camera = decoded["vector_settings"].get("camera", {})
+    set_analysis_camera(
+        camera.get("azimuth", ANALYSIS_CAMERA_DEFAULTS["azimuth"]),
+        camera.get("elevation", ANALYSIS_CAMERA_DEFAULTS["elevation"]),
+        camera.get("roll", ANALYSIS_CAMERA_DEFAULTS["roll"]),
+    )
+    for parameter in ("azimuth", "elevation", "roll"):
+        st.session_state[f"analysis_camera_{parameter}_slider"] = st.session_state[f"analysis_camera_{parameter}"]
+
+    st.session_state["vertical_profile_records"] = decoded["vertical_records"]
+    st.session_state["vertical_profile_finished"] = bool(decoded["vertical_records"])
+    st.session_state["vertical_profile_awaiting_continue"] = False
+    vertical_settings = decoded["vertical_settings"]
+    if vertical_settings:
+        st.session_state["vertical_profile_selected_variables"] = vertical_settings.get("selected_variables", [])
+        st.session_state["vertical_profile_profile_mode"] = "Raw Profiles"
+        st.session_state["vertical_profile_show_error_bars"] = vertical_settings.get("show_error_bars", True)
+        st.session_state["vertical_profile_contaminant_name"] = vertical_settings.get("contaminant_name", "Contaminant")
+        st.session_state["vertical_profile_concentration_unit"] = vertical_settings.get("concentration_unit", "")
+
+    st.session_state["replicate_analysis_state"] = decoded["replicate_analysis"]
+    preferred_method = decoded["ui_preferences"].get("analysis_method")
+    if preferred_method in {"3d_vector_plot", "vertical_profile_plot"}:
+        st.session_state["analysis_method"] = preferred_method
+    elif decoded["vector_records"]:
+        st.session_state["analysis_method"] = "3d_vector_plot"
+    elif decoded["vertical_records"]:
+        st.session_state["analysis_method"] = "vertical_profile_plot"
+    else:
+        st.session_state["analysis_method"] = None
+
+    analyses = decoded["metadata"].get("analyses", [])
+    st.session_state["loaded_project_summary"] = {
+        "project": decoded["metadata"].get("case_number") or "Untitled",
+        "date": decoded["metadata"].get("case_date"),
+        "analyses": analyses,
+        "format_version": decoded["metadata"].get("format_version"),
+    }
+    return st.session_state["loaded_project_summary"]
 
 
 def clamp_analysis_camera_value(parameter: str, value: float) -> float:
@@ -1674,22 +1801,7 @@ def selected_vertical_profile_variables() -> list[str]:
 
 
 def render_normalization_methods() -> None:
-    with st.expander("Normalization Methods"):
-        st.markdown(
-            """
-Normalized height:
-`Z = z / H`
-
-Normalized velocity:
-`U* = U / Us`
-
-Normalized temperature:
-`theta = (T - Tin) / (Tout - Tin)`
-
-Normalized concentration:
-`C* = (C - Cin) / (Cout - Cin)`
-"""
-        )
+    return None
 
 
 def render_vertical_profile_outputs(
@@ -1698,6 +1810,7 @@ def render_vertical_profile_outputs(
     profile_mode: str,
     contaminant_name: str,
     concentration_unit: str,
+    show_error_bars: bool = True,
 ) -> None:
     if not records:
         st.info("Add at least one vertical-profile dataset before generating the figure.")
@@ -1705,48 +1818,84 @@ def render_vertical_profile_outputs(
 
     st.markdown("### Vertical Profile Figure")
     try:
-        fig = plot_vertical_profiles(
+        si_fig = plot_vertical_profiles(
             records,
             selected_variables,
             profile_mode,
             contaminant_name,
             concentration_unit,
+            show_error_bars,
+            unit_system="si",
+        )
+        ip_fig = plot_vertical_profiles(
+            records,
+            selected_variables,
+            profile_mode,
+            contaminant_name,
+            concentration_unit,
+            show_error_bars,
+            unit_system="ip",
         )
     except ImportError:
         st.error("matplotlib is required for Vertical Profile plots. Run pip install -r requirements.txt.")
         return
 
-    st.pyplot(fig, clear_figure=False)
-    eps_bytes = export_vertical_profile_eps(fig)
-    png_bytes = export_vertical_profile_png(fig)
+    if show_error_bars and not records_have_plot_standard_deviation(records, profile_mode):
+        st.info("Standard deviation columns were not found, so the profile was plotted without error bars.")
+
+    st.markdown("#### SI Units")
+    st.pyplot(si_fig, clear_figure=False)
+    st.markdown("#### IP Units")
+    st.pyplot(ip_fig, clear_figure=False)
+    si_eps_bytes = export_vertical_profile_eps(si_fig)
+    si_png_bytes = export_vertical_profile_png(si_fig)
+    ip_eps_bytes = export_vertical_profile_eps(ip_fig)
+    ip_png_bytes = export_vertical_profile_png(ip_fig)
     summary_csv = vertical_profile_summary_csv(records, selected_variables)
     summary_xlsx = vertical_profile_summary_xlsx(records, selected_variables)
-    profile_type = "Normalized" if profile_mode == "Normalized Profiles" else "Raw"
     zip_bytes = build_vertical_profile_zip(
         [
-            (f"Vertical_Profile_{profile_type}.eps", eps_bytes),
-            (f"Vertical_Profile_{profile_type}.png", png_bytes),
+            ("Vertical_Profiles_SI.eps", si_eps_bytes),
+            ("Vertical_Profiles_SI.png", si_png_bytes),
+            ("Vertical_Profiles_IP.eps", ip_eps_bytes),
+            ("Vertical_Profiles_IP.png", ip_png_bytes),
             ("Vertical_Profile_Summary.csv", summary_csv),
             ("Vertical_Profile_Summary.xlsx", summary_xlsx),
         ]
     )
-    close_figure(fig)
+    close_figure(si_fig)
+    close_figure(ip_fig)
 
-    eps_col, png_col, csv_col, xlsx_col = st.columns(4)
-    eps_col.download_button(
-        "Download EPS",
-        data=eps_bytes,
-        file_name=f"Vertical_Profile_{profile_type}.eps",
+    si_eps_col, si_png_col, ip_eps_col, ip_png_col = st.columns(4)
+    si_eps_col.download_button(
+        "Download SI EPS",
+        data=si_eps_bytes,
+        file_name="Vertical_Profiles_SI.eps",
         mime="application/postscript",
-        key="vertical_profile_download_eps",
+        key="vertical_profile_download_si_eps",
     )
-    png_col.download_button(
-        "Download PNG",
-        data=png_bytes,
-        file_name=f"Vertical_Profile_{profile_type}.png",
+    si_png_col.download_button(
+        "Download SI PNG",
+        data=si_png_bytes,
+        file_name="Vertical_Profiles_SI.png",
         mime="image/png",
-        key="vertical_profile_download_png",
+        key="vertical_profile_download_si_png",
     )
+    ip_eps_col.download_button(
+        "Download IP EPS",
+        data=ip_eps_bytes,
+        file_name="Vertical_Profiles_IP.eps",
+        mime="application/postscript",
+        key="vertical_profile_download_ip_eps",
+    )
+    ip_png_col.download_button(
+        "Download IP PNG",
+        data=ip_png_bytes,
+        file_name="Vertical_Profiles_IP.png",
+        mime="image/png",
+        key="vertical_profile_download_ip_png",
+    )
+    csv_col, xlsx_col = st.columns(2)
     csv_col.download_button(
         "Summary CSV",
         data=summary_csv,
@@ -1802,28 +1951,39 @@ def render_vertical_profile_tool() -> None:
 
     if st.session_state.get("vertical_profile_finished"):
         selected_variables = st.session_state.get("vertical_profile_selected_variables", ["Air Velocity"])
-        profile_mode = st.session_state.get("vertical_profile_profile_mode", "Normalized Profiles")
+        profile_mode = "Raw Profiles"
         contaminant_name = st.session_state.get("vertical_profile_contaminant_name", "Contaminant")
         concentration_unit = st.session_state.get("vertical_profile_concentration_unit", "")
-        if profile_mode == "Normalized Profiles":
-            render_normalization_methods()
         render_vertical_profile_outputs(
             records,
             selected_variables,
             profile_mode,
             contaminant_name,
             concentration_unit,
+            st.session_state.get("vertical_profile_show_error_bars", True),
         )
         return
 
     if st.session_state.get("vertical_profile_awaiting_continue"):
-        st.markdown("### Do you want to add another position dataset?")
+        selected_variables = st.session_state.get("vertical_profile_selected_variables", ["Air Velocity"])
+        profile_mode = "Raw Profiles"
+        contaminant_name = st.session_state.get("vertical_profile_contaminant_name", "Contaminant")
+        concentration_unit = st.session_state.get("vertical_profile_concentration_unit", "")
+        render_vertical_profile_outputs(
+            records,
+            selected_variables,
+            profile_mode,
+            contaminant_name,
+            concentration_unit,
+            st.session_state.get("vertical_profile_show_error_bars", True),
+        )
+        st.markdown("### Continue this case or start a new case?")
         yes_col, no_col = st.columns(2)
-        if yes_col.button("Yes", key="vertical_profile_add_more_yes"):
+        if yes_col.button("Continue this case", key="vertical_profile_continue_case"):
             reset_vertical_profile_form()
             st.rerun()
-        if no_col.button("No", type="primary", key="vertical_profile_add_more_no"):
-            st.session_state["vertical_profile_finished"] = True
+        if no_col.button("Start new case analysis", type="primary", key="vertical_profile_start_new_case"):
+            reset_vertical_profile_analysis()
             st.rerun()
         return
 
@@ -1831,55 +1991,30 @@ def render_vertical_profile_tool() -> None:
     if dataset_type != "Experimental":
         st.warning("CFD input support is reserved for a future update.")
 
-    profile_mode = st.radio(
-        "Profile Type",
-        PROFILE_MODES,
-        horizontal=True,
-        index=0,
-        key="vertical_profile_mode_input",
-    )
+    profile_mode = "Raw Profiles"
     selected_variables = selected_vertical_profile_variables()
-    room_height_ft = st.number_input(
-        "Room Height H (ft)",
-        min_value=0.1,
-        value=DEFAULT_ROOM_HEIGHT_FT,
-        step=0.25,
-        key="vertical_profile_room_height",
+    show_error_bars = st.checkbox(
+        "Show replicate SD error bars",
+        value=True,
+        key="vertical_profile_show_error_bars_input",
     )
-    if profile_mode == "Normalized Profiles":
-        render_normalization_methods()
-
-    norm_col1, norm_col2, norm_col3 = st.columns(3)
+    room_height_ft = DEFAULT_ROOM_HEIGHT_FT
     supply_velocity = None
     tin = tout = None
     cin = cout = None
     contaminant_name = st.session_state.get("vertical_profile_contaminant_name", "Contaminant")
     concentration_unit = st.session_state.get("vertical_profile_concentration_unit", "")
-    if "Air Velocity" in selected_variables and profile_mode == "Normalized Profiles":
-        supply_velocity = norm_col1.number_input(
-            "Supply Air Velocity Us (m/s)",
-            min_value=0.0,
-            value=1.0,
-            step=0.1,
-            key="vertical_profile_supply_velocity",
-        )
-    if "Temperature" in selected_variables and profile_mode == "Normalized Profiles":
-        tin = norm_col2.number_input("Supply / Inlet Temperature Tin (deg C)", value=20.0, step=0.5)
-        tout = norm_col2.number_input("Exhaust / Outlet Temperature Tout (deg C)", value=25.0, step=0.5)
     if "Contaminant Concentration" in selected_variables:
-        contaminant_name = norm_col3.text_input(
+        contaminant_name = st.text_input(
             "Contaminant Name",
             value=contaminant_name,
             placeholder="CO2, Tracer gas, PM2.5",
         )
-        concentration_unit = norm_col3.text_input(
+        concentration_unit = st.text_input(
             "Concentration Unit",
             value=concentration_unit,
             placeholder="ppm, ppb, ug/m3, mg/m3",
         )
-        if profile_mode == "Normalized Profiles":
-            cin = norm_col3.number_input(f"Supply / Background Concentration Cin ({concentration_unit})", value=0.0)
-            cout = norm_col3.number_input(f"Exhaust Concentration Cout ({concentration_unit})", value=1.0)
 
     st.markdown("### Add one position dataset")
     input_col, height_col = st.columns([1, 1.4])
@@ -1897,12 +2032,94 @@ def render_vertical_profile_tool() -> None:
     st.caption(
         "Each selected variable may use its own CSV file. Timestamp alignment between source files is not required."
     )
+    use_replicate_profile = st.checkbox(
+        "Use replicate files for this position",
+        value=False,
+        key=f"vertical_profile_use_replicates_{st.session_state['vertical_profile_uploader_version']}",
+    )
     uploaded_files_by_variable = {}
     datasets_by_variable = {}
     dataframes_by_variable = {}
     source_files_by_variable = {}
+    replicate_datasets_by_variable = {}
+    replicate_dataframes_by_variable = {}
+    replicate_source_files_by_variable = {}
     velocity_upload = None
-    if "Air Velocity" in selected_variables:
+    if use_replicate_profile:
+        velocity_replicate_uploads = []
+        if "Air Velocity" in selected_variables:
+            with st.expander("Air Velocity Replicates", expanded=True):
+                velocity_replicate_uploads = [
+                    st.file_uploader(
+                        f"Velocity Replicate {index} file",
+                        type=["csv"],
+                        accept_multiple_files=False,
+                        key=f"vertical_profile_velocity_rep_{index}_{st.session_state['vertical_profile_uploader_version']}",
+                    )
+                    for index in (1, 2, 3)
+                ]
+                uploaded_files_by_variable["Air Velocity"] = velocity_replicate_uploads
+        if "Temperature" in selected_variables:
+            with st.expander("Temperature Replicates", expanded=False):
+                reuse_velocity_replicates = bool(velocity_replicate_uploads) and st.checkbox(
+                    "Reuse velocity replicate files",
+                    key=f"vertical_profile_reuse_velocity_temp_reps_{st.session_state['vertical_profile_uploader_version']}",
+                )
+                temperature_replicate_uploads = (
+                    velocity_replicate_uploads
+                    if reuse_velocity_replicates
+                    else [
+                        st.file_uploader(
+                            f"Temperature Replicate {index} file",
+                            type=["csv"],
+                            accept_multiple_files=False,
+                            key=f"vertical_profile_temperature_rep_{index}_{st.session_state['vertical_profile_uploader_version']}",
+                        )
+                        for index in (1, 2, 3)
+                    ]
+                )
+                uploaded_files_by_variable["Temperature"] = temperature_replicate_uploads
+        if "Contaminant Concentration" in selected_variables:
+            with st.expander("Contaminant Replicates", expanded=False):
+                reuse_velocity_replicates = bool(velocity_replicate_uploads) and st.checkbox(
+                    "Reuse velocity replicate files for contaminant",
+                    key=f"vertical_profile_reuse_velocity_cont_reps_{st.session_state['vertical_profile_uploader_version']}",
+                )
+                contaminant_replicate_uploads = (
+                    velocity_replicate_uploads
+                    if reuse_velocity_replicates
+                    else [
+                        st.file_uploader(
+                            f"Contaminant Replicate {index} file",
+                            type=["csv"],
+                            accept_multiple_files=False,
+                            key=f"vertical_profile_contaminant_rep_{index}_{st.session_state['vertical_profile_uploader_version']}",
+                        )
+                        for index in (1, 2, 3)
+                    ]
+                )
+                uploaded_files_by_variable["Contaminant Concentration"] = contaminant_replicate_uploads
+        for variable, uploaded_files in uploaded_files_by_variable.items():
+            replicate_datasets = []
+            replicate_dataframes = []
+            replicate_source_files = []
+            for uploaded_file in uploaded_files:
+                if uploaded_file is None:
+                    continue
+                dataset, read_error = read_csv_upload(uploaded_file)
+                if read_error:
+                    st.error(f"{variable}: {read_error}")
+                    continue
+                if dataset is not None:
+                    replicate_datasets.append(dataset)
+                    replicate_dataframes.append(dataset.dataframe)
+                    replicate_source_files.append(dataset.filename)
+            if replicate_datasets:
+                replicate_datasets_by_variable[variable] = replicate_datasets
+                replicate_dataframes_by_variable[variable] = replicate_dataframes
+                replicate_source_files_by_variable[variable] = replicate_source_files
+                datasets_by_variable[variable] = replicate_datasets[0]
+    elif "Air Velocity" in selected_variables:
         velocity_upload = st.file_uploader(
             "Velocity CSV upload",
             type=["csv"],
@@ -1911,7 +2128,7 @@ def render_vertical_profile_tool() -> None:
         )
         uploaded_files_by_variable["Air Velocity"] = velocity_upload
 
-    if "Temperature" in selected_variables:
+    if not use_replicate_profile and "Temperature" in selected_variables:
         use_velocity_for_temperature = False
         if velocity_upload is not None:
             use_velocity_for_temperature = st.checkbox(
@@ -1930,7 +2147,7 @@ def render_vertical_profile_tool() -> None:
         )
         uploaded_files_by_variable["Temperature"] = temperature_upload
 
-    if "Contaminant Concentration" in selected_variables:
+    if not use_replicate_profile and "Contaminant Concentration" in selected_variables:
         use_velocity_for_contaminant = False
         if velocity_upload is not None:
             use_velocity_for_contaminant = st.checkbox(
@@ -1949,23 +2166,27 @@ def render_vertical_profile_tool() -> None:
         )
         uploaded_files_by_variable["Contaminant Concentration"] = contaminant_upload
 
-    for variable, uploaded_file in uploaded_files_by_variable.items():
-        if uploaded_file is None:
-            continue
-        dataset, read_error = read_csv_upload(uploaded_file)
-        if read_error:
-            st.error(f"{variable}: {read_error}")
-            continue
-        if dataset is not None:
-            datasets_by_variable[variable] = dataset
-            dataframes_by_variable[variable] = dataset.dataframe
-            source_files_by_variable[variable] = dataset.filename
+    if not use_replicate_profile:
+        for variable, uploaded_file in uploaded_files_by_variable.items():
+            if uploaded_file is None:
+                continue
+            dataset, read_error = read_csv_upload(uploaded_file)
+            if read_error:
+                st.error(f"{variable}: {read_error}")
+                continue
+            if dataset is not None:
+                datasets_by_variable[variable] = dataset
+                dataframes_by_variable[variable] = dataset.dataframe
+                source_files_by_variable[variable] = dataset.filename
 
     temperature_columns = None
     contaminant_columns = None
     if "Temperature" in selected_variables and "Temperature" in datasets_by_variable:
         temperature_dataset = datasets_by_variable["Temperature"]
-        available_numeric_columns = numeric_columns(temperature_dataset.dataframe)
+        available_numeric_columns = [
+            column for column in numeric_columns(temperature_dataset.dataframe)
+            if not str(column).endswith("_std")
+        ]
         if not available_numeric_columns:
             st.error("The Temperature CSV does not contain numeric columns for temperature mapping.")
         else:
@@ -1984,7 +2205,10 @@ def render_vertical_profile_tool() -> None:
             ]
     if "Contaminant Concentration" in selected_variables and "Contaminant Concentration" in datasets_by_variable:
         contaminant_dataset = datasets_by_variable["Contaminant Concentration"]
-        available_numeric_columns = numeric_columns(contaminant_dataset.dataframe)
+        available_numeric_columns = [
+            column for column in numeric_columns(contaminant_dataset.dataframe)
+            if not str(column).endswith("_std")
+        ]
         if not available_numeric_columns:
             st.error("The Contaminant CSV does not contain numeric columns for concentration mapping.")
         else:
@@ -2003,29 +2227,54 @@ def render_vertical_profile_tool() -> None:
         if not selected_variables:
             st.error("Select at least one vertical-profile variable.")
             return
-        if not any(uploaded_files_by_variable.values()):
+        if use_replicate_profile:
+            has_uploads = any(replicate_dataframes_by_variable.values())
+        else:
+            has_uploads = any(uploaded_files_by_variable.values())
+        if not has_uploads:
             st.error("Please upload at least one source CSV for the selected variables.")
             return
 
-        new_records, errors = build_vertical_profile_records_from_sources(
-            dataframes_by_variable,
-            source_files_by_variable,
-            dataset_type,
-            position_number,
-            heights,
-            selected_variables,
-            profile_mode,
-            room_height_ft,
-            supply_velocity=supply_velocity,
-            temperature_columns=temperature_columns,
-            tin=tin,
-            tout=tout,
-            contaminant_columns=contaminant_columns,
-            contaminant_name=contaminant_name,
-            concentration_unit=concentration_unit,
-            cin=cin,
-            cout=cout,
-        )
+        if use_replicate_profile:
+            new_records, errors = build_replicate_vertical_profile_records(
+                replicate_dataframes_by_variable,
+                replicate_source_files_by_variable,
+                dataset_type,
+                position_number,
+                heights,
+                selected_variables,
+                profile_mode,
+                room_height_ft,
+                supply_velocity=supply_velocity,
+                temperature_columns=temperature_columns,
+                tin=tin,
+                tout=tout,
+                contaminant_columns=contaminant_columns,
+                contaminant_name=contaminant_name,
+                concentration_unit=concentration_unit,
+                cin=cin,
+                cout=cout,
+            )
+        else:
+            new_records, errors = build_vertical_profile_records_from_sources(
+                dataframes_by_variable,
+                source_files_by_variable,
+                dataset_type,
+                position_number,
+                heights,
+                selected_variables,
+                profile_mode,
+                room_height_ft,
+                supply_velocity=supply_velocity,
+                temperature_columns=temperature_columns,
+                tin=tin,
+                tout=tout,
+                contaminant_columns=contaminant_columns,
+                contaminant_name=contaminant_name,
+                concentration_unit=concentration_unit,
+                cin=cin,
+                cout=cout,
+            )
         if errors:
             for error in errors:
                 st.error(error)
@@ -2034,12 +2283,451 @@ def render_vertical_profile_tool() -> None:
         st.session_state["vertical_profile_records"].extend(new_records)
         st.session_state["vertical_profile_selected_variables"] = selected_variables
         st.session_state["vertical_profile_profile_mode"] = profile_mode
+        st.session_state["vertical_profile_show_error_bars"] = show_error_bars
         st.session_state["vertical_profile_contaminant_name"] = contaminant_name
         st.session_state["vertical_profile_concentration_unit"] = concentration_unit
         st.session_state["vertical_profile_awaiting_continue"] = True
-        processed_sources = ", ".join(sorted(set(source_files_by_variable.values())))
+        if use_replicate_profile:
+            processed_sources = ", ".join(
+                sorted(
+                    {
+                        filename
+                        for filenames in replicate_source_files_by_variable.values()
+                        for filename in filenames
+                    }
+                )
+            )
+        else:
+            processed_sources = ", ".join(sorted(set(source_files_by_variable.values())))
         st.success(f"Processed P{position_number} source data: {processed_sources}.")
         st.rerun()
+
+
+def validate_required_replicate_uploads(replicate_uploads: list[object | None]) -> tuple[list[object], str | None]:
+    required_count = 3
+    if len(replicate_uploads) != required_count or any(uploaded_file is None for uploaded_file in replicate_uploads):
+        return [], "Please upload all 3 replicate CSV files before processing."
+    return list(replicate_uploads), None
+
+
+def replicate_case_key(case_number: str | None, position_number: int, case_date: date | str | None) -> tuple[str, int, str]:
+    clean_case_number = (case_number or "").strip()
+    if isinstance(case_date, date):
+        clean_date = case_date.isoformat()
+    else:
+        clean_date = str(case_date or "")
+    return clean_case_number, int(position_number), clean_date
+
+
+def replicate_case_label(case_number: str | None, position_number: int, case_date: date | str | None = None) -> str:
+    case_text = f"C{str(case_number).strip()}" if case_number else "No case number"
+    date_text = case_date.isoformat() if isinstance(case_date, date) else str(case_date or "")
+    if date_text:
+        return f"{case_text} - P{position_number} - {date_text}"
+    return f"{case_text} - P{position_number}"
+
+
+def completed_replicate_cases() -> list[dict]:
+    state = st.session_state.setdefault("replicate_analysis_state", {})
+    return state.setdefault("completed_cases", [])
+
+
+def is_duplicate_replicate_case(case_number: str | None, position_number: int, case_date: date | str | None) -> bool:
+    current_key = replicate_case_key(case_number, position_number, case_date)
+    return any(completed_case.get("case_key") == current_key for completed_case in completed_replicate_cases())
+
+
+def reset_current_replicate_inputs() -> None:
+    st.session_state["replicate_input_version"] = st.session_state.get("replicate_input_version", 0) + 1
+    state = st.session_state.setdefault("replicate_analysis_state", {})
+    state["awaiting_next_case_choice"] = False
+    state["processed_dataframe"] = None
+    state["summary_dataframe"] = None
+    state["base_name"] = None
+
+
+def replicate_case_download_files(completed_case: dict) -> list[tuple[str, bytes]]:
+    base_name = completed_case.get("base_name", "ReplicateMeanSD")
+    summary_name = completed_case.get("summary_base_name", f"{base_name}_Summary")
+    processed_dataframe = completed_case.get("processed_dataframe")
+    summary_dataframe = completed_case.get("summary_dataframe")
+    files: list[tuple[str, bytes]] = []
+    if processed_dataframe is not None:
+        files.append((f"{base_name}.csv", replicate_dataframe_to_csv_bytes(processed_dataframe)))
+        files.append((f"{base_name}.xlsx", replicate_dataframe_to_xlsx_bytes(processed_dataframe, "ReplicateMeanSD")))
+    if summary_dataframe is not None:
+        files.append((f"{summary_name}.csv", replicate_dataframe_to_csv_bytes(summary_dataframe)))
+        files.append((f"{summary_name}.xlsx", replicate_dataframe_to_xlsx_bytes(summary_dataframe, "ReplicateSummary")))
+    return files
+
+
+def build_all_replicate_cases_zip(completed_cases: list[dict]) -> bytes:
+    files: list[tuple[str, bytes]] = []
+    for completed_case in completed_cases:
+        files.extend(replicate_case_download_files(completed_case))
+    return build_replicate_zip(files)
+
+
+def render_processed_replicate_cases_summary(completed_cases: list[dict]) -> None:
+    if not completed_cases:
+        return
+    st.markdown("### Processed cases")
+    summary_rows = [
+        {
+            "Case": completed_case.get("case_number") or "",
+            "Position": f"P{completed_case.get('position_number')}",
+            "Date": completed_case.get("case_date") or "",
+            "Aligned Observations": completed_case.get("aligned_observations"),
+            "Output": f"{completed_case.get('base_name')}.csv",
+        }
+        for completed_case in completed_cases
+    ]
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    for index, completed_case in enumerate(completed_cases, start=1):
+        label = replicate_case_label(
+            completed_case.get("case_number"),
+            int(completed_case.get("position_number") or 0),
+            completed_case.get("case_date"),
+        )
+        with st.expander(label, expanded=index == len(completed_cases)):
+            summary_dataframe = completed_case.get("summary_dataframe")
+            if summary_dataframe is not None:
+                st.dataframe(summary_dataframe, use_container_width=True, hide_index=True)
+            files = replicate_case_download_files(completed_case)
+            if files:
+                col1, col2 = st.columns(2)
+                base_name = completed_case.get("base_name", f"ReplicateCase{index}")
+                processed_csv = dict(files).get(f"{base_name}.csv")
+                processed_xlsx = dict(files).get(f"{base_name}.xlsx")
+                if processed_csv:
+                    col1.download_button(
+                        "Download CSV",
+                        processed_csv,
+                        f"{base_name}.csv",
+                        "text/csv",
+                        key=f"replicate_case_{index}_csv",
+                    )
+                if processed_xlsx:
+                    col2.download_button(
+                        "Download XLSX",
+                        processed_xlsx,
+                        f"{base_name}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"replicate_case_{index}_xlsx",
+                    )
+                st.download_button(
+                    "Download Case ZIP",
+                    build_replicate_zip(files),
+                    f"{base_name}_Files.zip",
+                    "application/zip",
+                    key=f"replicate_case_{index}_zip",
+                )
+    if len(completed_cases) > 1:
+        st.download_button(
+            "Download All Processed Replicate Cases",
+            build_all_replicate_cases_zip(completed_cases),
+            "All_Replicate_Cases.zip",
+            "application/zip",
+            key="replicate_all_cases_zip",
+        )
+
+
+def render_replicate_mean_sd_tool(show_back_button: bool = True) -> None:
+    if show_back_button and st.button("Back to Data Analysis", key="analysis_back_from_replicate"):
+        st.session_state["analysis_method"] = None
+        st.rerun()
+
+    st.subheader("Replicate Mean & SD")
+    st.write("Combine replicate measurements and calculate mean and sample standard deviation for matching numeric variables.")
+
+    existing_state = st.session_state.setdefault("replicate_analysis_state", {})
+    input_version = st.session_state.setdefault("replicate_input_version", 0)
+    if existing_state.get("processed_dataframe") is not None and existing_state.get("summary_dataframe") is not None:
+        st.markdown("### Current Replicate Analysis")
+        st.dataframe(existing_state["summary_dataframe"], use_container_width=True, hide_index=True)
+        base_name = existing_state.get("base_name", "ReplicateMeanSD")
+        processed_csv = replicate_dataframe_to_csv_bytes(existing_state["processed_dataframe"])
+        processed_xlsx = replicate_dataframe_to_xlsx_bytes(existing_state["processed_dataframe"], "ReplicateMeanSD")
+        summary_csv = replicate_dataframe_to_csv_bytes(existing_state["summary_dataframe"])
+        summary_xlsx = replicate_dataframe_to_xlsx_bytes(existing_state["summary_dataframe"], "ReplicateSummary")
+        zip_bytes = build_replicate_zip(
+            [
+                (f"{base_name}.csv", processed_csv),
+                (f"{base_name}.xlsx", processed_xlsx),
+                (f"{base_name}_Summary.csv", summary_csv),
+                (f"{base_name}_Summary.xlsx", summary_xlsx),
+            ]
+        )
+        col1, col2, col3 = st.columns(3)
+        col1.download_button("Download Current Processed CSV", processed_csv, f"{base_name}.csv", "text/csv", key="replicate_current_csv")
+        col2.download_button("Download Current Summary XLSX", summary_xlsx, f"{base_name}_Summary.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="replicate_current_summary_xlsx")
+        col3.download_button("Download Current ZIP", zip_bytes, f"{base_name}_Files.zip", "application/zip", key="replicate_current_zip")
+
+    completed_cases = completed_replicate_cases()
+    render_processed_replicate_cases_summary(completed_cases)
+
+    meta_col1, meta_col2, meta_col3 = st.columns(3)
+    position_number = meta_col1.selectbox(
+        "Position Number",
+        options=list(range(1, 7)),
+        format_func=lambda value: f"P{value}",
+        key=f"replicate_position_number_{input_version}",
+    )
+    case_number = meta_col2.text_input(
+        "Case number if applicable",
+        value="",
+        placeholder="03",
+        key=f"replicate_case_number_{input_version}",
+    )
+    replicate_date = meta_col3.date_input(
+        "Date if applicable",
+        value=date.today(),
+        key=f"replicate_date_{input_version}",
+    )
+
+    alignment_mode = st.radio(
+        "Alignment mode",
+        options=("row", "timestamp"),
+        format_func=lambda value: "Measurement sequence" if value == "row" else "Exact timestamp",
+        horizontal=True,
+        key=f"replicate_alignment_mode_{input_version}",
+    )
+    if alignment_mode == "row":
+        st.caption("Output TIMESTAMP is taken from Replicate 1 when measurement-sequence alignment is used.")
+    include_optional_numeric = st.checkbox(
+        "Include all matching numeric columns",
+        value=True,
+        key=f"replicate_include_optional_numeric_{input_version}",
+    )
+    duplicate_current_case = is_duplicate_replicate_case(case_number.strip() or None, position_number, replicate_date)
+    allow_duplicate_reprocess = False
+    if duplicate_current_case:
+        st.warning(
+            f"{replicate_case_label(case_number.strip() or None, position_number, replicate_date)} "
+            "has already been processed in this session."
+        )
+        allow_duplicate_reprocess = st.checkbox(
+            "I want to intentionally reprocess this case",
+            value=False,
+            key=f"replicate_allow_duplicate_{input_version}",
+        )
+
+    st.markdown("### Replicate CSV files")
+    replicate_uploads = [
+        st.file_uploader(
+            "Replicate 1 CSV",
+            type=["csv"],
+            accept_multiple_files=False,
+            key=f"replicate_file_1_{input_version}",
+        ),
+        st.file_uploader(
+            "Replicate 2 CSV",
+            type=["csv"],
+            accept_multiple_files=False,
+            key=f"replicate_file_2_{input_version}",
+        ),
+        st.file_uploader(
+            "Replicate 3 CSV",
+            type=["csv"],
+            accept_multiple_files=False,
+            key=f"replicate_file_3_{input_version}",
+        ),
+    ]
+    ready_uploads, upload_error = validate_required_replicate_uploads(replicate_uploads)
+    if not upload_error:
+        st.markdown("#### Uploaded replicate group")
+        for replicate_index, uploaded_file in enumerate(ready_uploads, start=1):
+            st.write(f"Replicate {replicate_index}: `{uploaded_file.name}`")
+
+    if st.button("Process Replicates", type="primary"):
+        if upload_error:
+            st.error(upload_error)
+            return
+        if duplicate_current_case and not allow_duplicate_reprocess:
+            st.warning("This case already exists. Confirm intentional reprocessing before processing again.")
+            return
+
+        with st.spinner("Processing replicate files..."):
+            datasets: list[ReplicateDataset] = []
+            for uploaded_file in ready_uploads:
+                dataset, read_error = read_csv_upload(uploaded_file)
+                if read_error:
+                    st.error(read_error)
+                    return
+                if dataset is not None:
+                    datasets.append(ReplicateDataset(dataset.filename, dataset.dataframe))
+
+            if len(datasets) != 3:
+                st.error("Please upload all 3 replicate CSV files before processing.")
+                return
+
+            processed_dataframe, alignment_report, errors = rowwise_replicate_statistics(
+                datasets,
+                include_optional_numeric=include_optional_numeric,
+                alignment_mode=alignment_mode,
+            )
+        if errors:
+            for error in errors:
+                st.error(error)
+            return
+
+        summary_dataframe = replicate_summary_statistics(processed_dataframe)
+        case_prefix = f"C{case_number.strip()}_" if case_number.strip() else ""
+        base_name = f"{case_prefix}P{position_number:02d}_ReplicateMeanSD"
+        processed_csv = replicate_dataframe_to_csv_bytes(processed_dataframe)
+        processed_xlsx = replicate_dataframe_to_xlsx_bytes(processed_dataframe, "ReplicateMeanSD")
+        summary_csv = replicate_dataframe_to_csv_bytes(summary_dataframe)
+        summary_xlsx = replicate_dataframe_to_xlsx_bytes(summary_dataframe, "ReplicateSummary")
+        zip_bytes = build_replicate_zip(
+            [
+                (f"{base_name}.csv", processed_csv),
+                (f"{base_name}.xlsx", processed_xlsx),
+                (f"{case_prefix}P{position_number:02d}_ReplicateSummary.csv", summary_csv),
+                (f"{case_prefix}P{position_number:02d}_ReplicateSummary.xlsx", summary_xlsx),
+            ]
+        )
+        completed_case = {
+            "case_key": replicate_case_key(case_number.strip() or None, position_number, replicate_date),
+            "position_number": position_number,
+            "case_number": case_number.strip() or None,
+            "case_date": replicate_date.isoformat() if replicate_date else None,
+            "replicate_count": len(datasets),
+            "source_files": [dataset.filename for dataset in datasets],
+            "alignment": {
+                "method": alignment_report.method,
+                "matched_rows": alignment_report.matched_rows,
+                "unmatched_rows": alignment_report.unmatched_rows,
+                "warnings": alignment_report.warnings,
+            },
+            "aligned_observations": alignment_report.matched_rows,
+            "base_name": base_name,
+            "summary_base_name": f"{case_prefix}P{position_number:02d}_ReplicateSummary",
+            "processed_dataframe": processed_dataframe,
+            "summary_dataframe": summary_dataframe,
+        }
+        completed_cases.append(completed_case)
+        st.session_state["replicate_analysis_state"] = {
+            **existing_state,
+            "completed_cases": completed_cases,
+            "position_number": position_number,
+            "case_number": case_number.strip() or None,
+            "case_date": replicate_date.isoformat() if replicate_date else None,
+            "replicate_count": len(datasets),
+            "source_files": [dataset.filename for dataset in datasets],
+            "alignment": {
+                "method": alignment_report.method,
+                "matched_rows": alignment_report.matched_rows,
+                "unmatched_rows": alignment_report.unmatched_rows,
+                "warnings": alignment_report.warnings,
+            },
+            "base_name": base_name,
+            "processed_dataframe": processed_dataframe,
+            "summary_dataframe": summary_dataframe,
+            "awaiting_next_case_choice": True,
+        }
+
+        st.success("Replicate processing completed successfully.")
+        st.success(f"Processed {len(datasets)} replicate files for P{position_number}.")
+        st.write(
+            "Alignment: `Measurement sequence`"
+            if alignment_report.method == "measurement_sequence"
+            else "Alignment: `Exact timestamp`"
+        )
+        st.write(f"Replicate files: `{len(datasets):,}`")
+        if alignment_report.input_rows:
+            st.write("Rows:")
+            for filename, row_count in alignment_report.input_rows.items():
+                st.write(f"- {filename}: `{row_count:,}`")
+        st.write(f"Aligned observations: `{alignment_report.matched_rows:,}`")
+        if any(alignment_report.unmatched_rows.values()):
+            label = "Trailing rows excluded" if alignment_report.method == "measurement_sequence" else "Rows excluded"
+            st.warning(f"{label}: {alignment_report.unmatched_rows}")
+        for warning in alignment_report.warnings:
+            st.info(warning)
+        st.dataframe(summary_dataframe, use_container_width=True, hide_index=True)
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.download_button("Download Processed CSV", processed_csv, f"{base_name}.csv", "text/csv")
+        col2.download_button(
+            "Download Processed XLSX",
+            processed_xlsx,
+            f"{base_name}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        col3.download_button("Download Summary CSV", summary_csv, f"{case_prefix}P{position_number:02d}_ReplicateSummary.csv", "text/csv")
+        col4.download_button(
+            "Download Summary XLSX",
+            summary_xlsx,
+            f"{case_prefix}P{position_number:02d}_ReplicateSummary.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "Download All Replicate Analysis Files",
+            zip_bytes,
+            f"{base_name}_Files.zip",
+            "application/zip",
+        )
+
+    if st.session_state.get("replicate_analysis_state", {}).get("awaiting_next_case_choice"):
+        st.markdown("## Process another case?")
+        next_col, finish_col = st.columns(2)
+        if next_col.button("Yes, process another case", key="replicate_process_another_case"):
+            reset_current_replicate_inputs()
+            st.rerun()
+        if finish_col.button("No, finish", key="replicate_finish_batch"):
+            st.session_state["replicate_analysis_state"]["awaiting_next_case_choice"] = False
+            st.success("Finished replicate processing. Completed case results remain available above.")
+
+
+def render_project_controls() -> None:
+    st.markdown("### Project")
+    load_col, save_col, new_col = st.columns([1.4, 1.2, 1])
+    uploaded_project = load_col.file_uploader(
+        "Load Existing Project",
+        type=["edtproj"],
+        accept_multiple_files=False,
+        key="project_load_uploader",
+    )
+    if uploaded_project is not None and load_col.button("Load Project", type="primary"):
+        try:
+            project_state = load_project_archive(uploaded_project.getvalue())
+            summary = restore_project_to_session(project_state)
+            st.success("Project loaded successfully.")
+            st.session_state["loaded_project_summary"] = summary
+            st.rerun()
+        except ProjectLoadError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Project could not be loaded: {exc}")
+
+    project_state = build_current_project_state()
+    project_bytes = save_project_archive(project_state)
+    case_number, case_date = current_project_case_metadata()
+    save_col.download_button(
+        "Save Project",
+        data=project_bytes,
+        file_name=project_filename(case_number, case_date),
+        mime="application/octet-stream",
+        key="project_save_download",
+    )
+
+    new_col.caption("Starting a new analysis clears only Data Analysis project state.")
+    if new_col.button("Start New Analysis"):
+        clear_data_analysis_project_state()
+        st.success("Started a new Data Analysis project.")
+        st.rerun()
+
+    summary = st.session_state.get("loaded_project_summary")
+    if summary:
+        analyses = summary.get("analyses") or []
+        st.info(
+            "Project: "
+            f"{summary.get('project')}\n\n"
+            f"Date: {summary.get('date') or 'Not set'}\n\n"
+            "Available analyses: "
+            f"{', '.join(analyses) if analyses else 'None'}\n\n"
+            f"Project format version: {summary.get('format_version')}"
+        )
 
 
 def render_data_analysis_landing() -> None:
@@ -2062,6 +2750,11 @@ def render_data_analysis_landing() -> None:
 
 def render_data_analysis_tool() -> None:
     st.session_state.setdefault("analysis_method", None)
+    init_analysis_state()
+    init_vertical_profile_state()
+    st.session_state.setdefault("replicate_analysis_state", {})
+    st.session_state.setdefault("project_metadata", {})
+    render_project_controls()
     if st.session_state["analysis_method"] == "3d_vector_plot":
         render_3d_vector_plot_tool()
     elif st.session_state["analysis_method"] == "vertical_profile_plot":
